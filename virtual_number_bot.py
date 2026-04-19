@@ -24,20 +24,20 @@ from telegram.ext import (
 # ──────────────────────────────────────────────
 #  CONFIG  ← Yahan apni details bharo
 # ──────────────────────────────────────────────
-BOT_TOKEN      = "YOUR_BOT_TOKEN_HERE"
-ADMIN_IDS      = [123456789]
-PAYMENT_INFO   = "UPI: yourname@upi\nBank: XXXX-XXXX"
-API_ID         = 12345678
-API_HASH       = "your_api_hash_here"
+BOT_TOKEN      = "8374340113:AAElS1BoY4qIL7yt-Tcq_pbVRJc07gG1q6A"
+ADMIN_IDS      = [8263530800]
+PAYMENT_INFO   = "UPI: solankiraghu7572-1@okhdfcbank"
+API_ID         = 39917988
+API_HASH       = "bd827dbeac6a55896ff11539bc80365b"
 
 # Force Join – apne channel ka username (@ ke bina) ya ID
-FORCE_CHANNEL_USERNAME = "yourchannel"
-FORCE_CHANNEL_LINK     = "https://t.me/yourchannel"
-FORCE_CHANNEL_ID       = -1001234567890
+FORCE_CHANNEL_USERNAME = "@datacheak"
+FORCE_CHANNEL_LINK     = "https://t.me/datacheak"
+FORCE_CHANNEL_ID       = -1003581162306
 
 # Support
-SUPPORT_GROUP_LINK   = "https://t.me/yoursupportgroup"
-SUPPORT_CHANNEL_LINK = "https://t.me/yourchannel"
+SUPPORT_GROUP_LINK   = "https://t.me/yughumai"
+SUPPORT_CHANNEL_LINK = "https://t.me/datacheak"
 
 SESSIONS_DIR = Path("sessions")
 SESSIONS_DIR.mkdir(exist_ok=True)
