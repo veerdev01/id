@@ -400,8 +400,8 @@ async def buy_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     bought = []
     for n in nums:
-        db_run("UPDATE numbers SET status='sold' WHERE id=?", (n["id"],))
-        db_insert("INSERT INTO orders (user_id,username,number_id,status) VALUES (?,?,?,'confirmed')",
+        db_run("UPDATE numbers SET status='reserved' WHERE id=?", (n["id"],))
+        db_insert("INSERT INTO orders (user_id,username,number_id,status) VALUES (?,?,?,'pending')",
                   (user.id, user.username or user.first_name, n["id"]))
         bought.append(n)
 
@@ -1083,6 +1083,9 @@ async def start_otp_listener(bot_app, number_id, buyer_id, number_str):
             await bot_app.bot.send_message(buyer_id, reply, parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="menu:home")]]))
         except Exception as e: log.error(e)
+        # OTP aaya → sold mark karo, order confirm karo
+        db_run("UPDATE numbers SET status='sold' WHERE id=?", (number_id,))
+        db_run("UPDATE orders SET status='confirmed' WHERE number_id=? AND user_id=?", (number_id, buyer_id))
         received.set()
 
     client.add_handler(PyroMsgHandler(on_message))
@@ -1090,10 +1093,32 @@ async def start_otp_listener(bot_app, number_id, buyer_id, number_str):
         await client.start()
         try: await asyncio.wait_for(received.wait(), timeout=OTP_TIMEOUT)
         except asyncio.TimeoutError:
+            # OTP nahi aaya → stock wapas + refund
+            db_run("UPDATE numbers SET status='available' WHERE id=?", (number_id,))
+            db_run("UPDATE orders SET status='cancelled' WHERE number_id=? AND user_id=?", (number_id, buyer_id))
+            row = db_one("SELECT price FROM numbers WHERE id=?", (number_id,))
+            refund_amt = row["price"] if row else 0
+            if refund_amt:
+                db_run("UPDATE users SET balance = balance + ? WHERE user_id=?", (refund_amt, buyer_id))
             await bot_app.bot.send_message(buyer_id,
-                f"⏰ *Timeout!* {OTP_TIMEOUT} sec mein OTP nahi aaya.\n💬 Support se contact karein.",
+                f"⏰ *OTP Nahi Aaya!*\n\n"
+                f"⏳ {OTP_TIMEOUT} sec mein koi message nahi aaya.\n"
+                f"💰 *₹{refund_amt} Refund Ho Gaya!*\n\n"
+                f"Balance mein wapas aa gaya. Dobara try kar sakte ho! 😊",
                 parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💬 Support", url=SUPPORT_GROUP_LINK)]]))
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🛒 Dobara Kharido", callback_data="menu:buynumber")],
+                    [InlineKeyboardButton("🏠 Main Menu",      callback_data="menu:home")],
+                ]))
+            for aid in ADMIN_IDS:
+                try:
+                    await bot_app.bot.send_message(aid,
+                        f"⚠️ *OTP Timeout – Refund Hua*\n"
+                        f"📞 `{number_str}`\n"
+                        f"👤 User: `{buyer_id}`\n"
+                        f"💰 Refund: ₹{refund_amt}",
+                        parse_mode="Markdown")
+                except Exception: pass
     finally:
         try: await client.stop()
         except Exception: pass
