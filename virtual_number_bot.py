@@ -769,17 +769,41 @@ async def zip_price_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     session_files = list(extract_dir.glob("*.session"))
     added = 0; skipped = 0
 
-    # Purani Pyrogram schema fix karo (no such column: number)
+    # Session schema fix karo (Pyrogram compatibility)
     for sf in session_files:
         try:
             con = sqlite3.connect(str(sf))
-            cols = [r[1] for r in con.execute('PRAGMA table_info(sessions)').fetchall()]
-            if 'number' not in cols:
-                con.execute('ALTER TABLE sessions ADD COLUMN number TEXT')
-                con.commit()
+            con.executescript('''
+                CREATE TABLE IF NOT EXISTS sessions (
+                    dc_id INTEGER PRIMARY KEY,
+                    api_id INTEGER,
+                    test_mode INTEGER,
+                    auth_key BLOB,
+                    date INTEGER NOT NULL DEFAULT 0,
+                    user_id INTEGER,
+                    is_bot INTEGER
+                );
+                CREATE TABLE IF NOT EXISTS peers (
+                    id INTEGER PRIMARY KEY,
+                    access_hash INTEGER,
+                    type TEXT NOT NULL,
+                    username TEXT,
+                    phone_number TEXT,
+                    last_update_on INTEGER NOT NULL DEFAULT (CAST(STRFTIME('%s', 'now') AS INTEGER))
+                );
+                CREATE TABLE IF NOT EXISTS version (number INTEGER);
+            ''')
+            if not con.execute('SELECT * FROM version').fetchone():
+                con.execute('INSERT INTO version VALUES (1)')
+            vcols = [r[1] for r in con.execute('PRAGMA table_info(version)').fetchall()]
+            if 'number' not in vcols:
+                con.execute('ALTER TABLE version ADD COLUMN number INTEGER DEFAULT 1')
+                if not con.execute('SELECT * FROM version').fetchone():
+                    con.execute('INSERT INTO version VALUES (1)')
+            con.commit()
             con.close()
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning(f"Schema fix error {sf}: {e}")
 
     for sf in session_files:
         phone        = sf.stem
@@ -1082,16 +1106,42 @@ async def start_otp_listener(bot_app, number_id, buyer_id, number_str):
     if not session_path.exists():
         await bot_app.bot.send_message(buyer_id, "❌ Session file disk pe nahi hai."); return
 
-    # Schema fix karo client start se pehle
+    # Session schema fix karo client start se pehle
     try:
         con = sqlite3.connect(str(session_path))
-        cols = [r[1] for r in con.execute('PRAGMA table_info(sessions)').fetchall()]
-        if 'number' not in cols:
-            con.execute('ALTER TABLE sessions ADD COLUMN number TEXT')
-            con.commit()
+        con.executescript('''
+            CREATE TABLE IF NOT EXISTS sessions (
+                dc_id INTEGER PRIMARY KEY,
+                api_id INTEGER,
+                test_mode INTEGER,
+                auth_key BLOB,
+                date INTEGER NOT NULL DEFAULT 0,
+                user_id INTEGER,
+                is_bot INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS peers (
+                id INTEGER PRIMARY KEY,
+                access_hash INTEGER,
+                type TEXT NOT NULL,
+                username TEXT,
+                phone_number TEXT,
+                last_update_on INTEGER NOT NULL DEFAULT (CAST(STRFTIME('%s', 'now') AS INTEGER))
+            );
+            CREATE TABLE IF NOT EXISTS version (number INTEGER);
+        ''')
+        # version row ensure karo
+        if not con.execute('SELECT * FROM version').fetchone():
+            con.execute('INSERT INTO version VALUES (1)')
+        # version.number column ensure karo
+        vcols = [r[1] for r in con.execute('PRAGMA table_info(version)').fetchall()]
+        if 'number' not in vcols:
+            con.execute('ALTER TABLE version ADD COLUMN number INTEGER DEFAULT 1')
+            if not con.execute('SELECT * FROM version').fetchone():
+                con.execute('INSERT INTO version VALUES (1)')
+        con.commit()
         con.close()
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning(f"Session schema fix error {session_path}: {e}")
 
     client   = Client(str(session_path.with_suffix("")), api_id=API_ID, api_hash=API_HASH)
     active_listeners[number_id] = client
