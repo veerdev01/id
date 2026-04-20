@@ -121,6 +121,87 @@ def extract_otp(text):
 def is_admin(uid): return uid in ADMIN_IDS
 
 # ──────────────────────────────────────────────
+#  SESSION SCHEMA FIX (MAIN FIX)
+# ──────────────────────────────────────────────
+def fix_session_schema(session_path: str):
+    """
+    Ensure full Pyrogram-compatible schema in any .session SQLite file.
+    Handles both missing tables AND missing columns in existing tables.
+    """
+    try:
+        con = sqlite3.connect(session_path)
+
+        # 1. Create tables if they don't exist at all
+        con.executescript('''
+            CREATE TABLE IF NOT EXISTS sessions (
+                dc_id        INTEGER PRIMARY KEY,
+                api_id       INTEGER,
+                test_mode    INTEGER,
+                auth_key     BLOB,
+                date         INTEGER NOT NULL DEFAULT 0,
+                user_id      INTEGER,
+                is_bot       INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS peers (
+                id              INTEGER PRIMARY KEY,
+                access_hash     INTEGER,
+                type            TEXT NOT NULL,
+                username        TEXT,
+                phone_number    TEXT,
+                last_update_on  INTEGER NOT NULL DEFAULT (CAST(STRFTIME('%s','now') AS INTEGER))
+            );
+            CREATE TABLE IF NOT EXISTS version (number INTEGER);
+        ''')
+
+        # 2. Add missing columns to sessions table (if table already existed without them)
+        existing_cols = {row[1] for row in con.execute("PRAGMA table_info(sessions)").fetchall()}
+        required_cols = {
+            "api_id":    "INTEGER",
+            "test_mode": "INTEGER",
+            "auth_key":  "BLOB",
+            "date":      "INTEGER NOT NULL DEFAULT 0",
+            "user_id":   "INTEGER",
+            "is_bot":    "INTEGER",
+        }
+        for col, col_type in required_cols.items():
+            if col not in existing_cols:
+                try:
+                    con.execute(f"ALTER TABLE sessions ADD COLUMN {col} {col_type}")
+                    log.info(f"Added missing column '{col}' to sessions in {session_path}")
+                except Exception as e:
+                    log.warning(f"Could not add column '{col}' in {session_path}: {e}")
+
+        # 3. Add missing columns to peers table
+        peer_cols = {row[1] for row in con.execute("PRAGMA table_info(peers)").fetchall()}
+        required_peer_cols = {
+            "access_hash":    "INTEGER",
+            "username":       "TEXT",
+            "phone_number":   "TEXT",
+            "last_update_on": "INTEGER NOT NULL DEFAULT (CAST(STRFTIME('%s','now') AS INTEGER))",
+        }
+        for col, col_type in required_peer_cols.items():
+            if col not in peer_cols:
+                try:
+                    con.execute(f"ALTER TABLE peers ADD COLUMN {col} {col_type}")
+                except Exception as e:
+                    log.warning(f"Could not add peer column '{col}' in {session_path}: {e}")
+
+        # 4. Ensure version table has the 'number' column and at least one row
+        vcols = {row[1] for row in con.execute("PRAGMA table_info(version)").fetchall()}
+        if "number" not in vcols:
+            try:
+                con.execute("ALTER TABLE version ADD COLUMN number INTEGER DEFAULT 1")
+            except Exception:
+                pass
+        if not con.execute("SELECT * FROM version").fetchone():
+            con.execute("INSERT INTO version VALUES (1)")
+
+        con.commit()
+        con.close()
+    except Exception as e:
+        log.warning(f"fix_session_schema error [{session_path}]: {e}")
+
+# ──────────────────────────────────────────────
 #  CONVERSATION STATES
 # ──────────────────────────────────────────────
 # Admin: Add number (manual OTP)
@@ -642,9 +723,7 @@ async def cb_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Back", callback_data="menu:admin")]]))
 
     elif action == "sessions":
-        files = []
-        for sf in SESSIONS_DIR.rglob("*.session"):
-            files.append(sf)
+        files = list(SESSIONS_DIR.rglob("*.session"))
         text  = "📁 *Sessions:*\n\n"
         if not files: text += "Koi session nahi."
         else:
@@ -657,8 +736,7 @@ async def cb_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Back", callback_data="menu:admin")]]))
 
     elif action == "zipupload":
-        # ZIP upload conversation start – handled by zip_conv
-        pass
+        pass  # handled by zip_conv ConversationHandler
 
 async def cb_delete_number(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
@@ -751,7 +829,6 @@ async def zip_price_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     country  = ctx.user_data["zip_country"]
     zip_path = Path(ctx.user_data["zip_path"])
 
-    # Extract folder: sessions/Telegram/Myanmar/
     extract_dir = SESSIONS_DIR / platform / country
     extract_dir.mkdir(parents=True, exist_ok=True)
 
@@ -765,50 +842,17 @@ async def zip_price_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ ZIP extract error: `{e}`", parse_mode="Markdown")
         return ConversationHandler.END
 
-    # Session files scan
     session_files = list(extract_dir.glob("*.session"))
     added = 0; skipped = 0
 
-    # Session schema fix karo (Pyrogram compatibility)
+    # Fix schema for all extracted session files
     for sf in session_files:
-        try:
-            con = sqlite3.connect(str(sf))
-            con.executescript('''
-                CREATE TABLE IF NOT EXISTS sessions (
-                    dc_id INTEGER PRIMARY KEY,
-                    api_id INTEGER,
-                    test_mode INTEGER,
-                    auth_key BLOB,
-                    date INTEGER NOT NULL DEFAULT 0,
-                    user_id INTEGER,
-                    is_bot INTEGER
-                );
-                CREATE TABLE IF NOT EXISTS peers (
-                    id INTEGER PRIMARY KEY,
-                    access_hash INTEGER,
-                    type TEXT NOT NULL,
-                    username TEXT,
-                    phone_number TEXT,
-                    last_update_on INTEGER NOT NULL DEFAULT (CAST(STRFTIME('%s', 'now') AS INTEGER))
-                );
-                CREATE TABLE IF NOT EXISTS version (number INTEGER);
-            ''')
-            if not con.execute('SELECT * FROM version').fetchone():
-                con.execute('INSERT INTO version VALUES (1)')
-            vcols = [r[1] for r in con.execute('PRAGMA table_info(version)').fetchall()]
-            if 'number' not in vcols:
-                con.execute('ALTER TABLE version ADD COLUMN number INTEGER DEFAULT 1')
-                if not con.execute('SELECT * FROM version').fetchone():
-                    con.execute('INSERT INTO version VALUES (1)')
-            con.commit()
-            con.close()
-        except Exception as e:
-            log.warning(f"Schema fix error {sf}: {e}")
+        fix_session_schema(str(sf))
 
     for sf in session_files:
-        phone        = sf.stem
-        session_rel  = f"{platform}/{country}/{sf.name}"
-        number       = phone if phone.startswith("+") else f"+{phone}"
+        phone       = sf.stem
+        session_rel = f"{platform}/{country}/{sf.name}"
+        number      = phone if phone.startswith("+") else f"+{phone}"
 
         existing = db_one("SELECT id FROM numbers WHERE session_file=? OR number=?", (session_rel, number))
         if existing:
@@ -842,7 +886,6 @@ async def zip_price_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def zip_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # Temp zip cleanup
     zip_path = ctx.user_data.pop("zip_path", None)
     if zip_path:
         p = Path(zip_path)
@@ -1095,53 +1138,20 @@ async def admin_topup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ User `{uid}` ko ₹{amount} add. New balance: ₹{new_bal}", parse_mode="Markdown")
 
 # ══════════════════════════════════════════════
-#  OTP LISTENER (After purchase)
+#  OTP LISTENER (After purchase) — FIXED
 # ══════════════════════════════════════════════
 
 async def start_otp_listener(bot_app, number_id, buyer_id, number_str):
     row = db_one("SELECT session_file FROM numbers WHERE id=?", (number_id,))
     if not row or not row["session_file"]:
         await bot_app.bot.send_message(buyer_id, "❌ Session file missing."); return
+
     session_path = SESSIONS_DIR / row["session_file"]
     if not session_path.exists():
         await bot_app.bot.send_message(buyer_id, "❌ Session file disk pe nahi hai."); return
 
-    # Session schema fix karo client start se pehle
-    try:
-        con = sqlite3.connect(str(session_path))
-        con.executescript('''
-            CREATE TABLE IF NOT EXISTS sessions (
-                dc_id INTEGER PRIMARY KEY,
-                api_id INTEGER,
-                test_mode INTEGER,
-                auth_key BLOB,
-                date INTEGER NOT NULL DEFAULT 0,
-                user_id INTEGER,
-                is_bot INTEGER
-            );
-            CREATE TABLE IF NOT EXISTS peers (
-                id INTEGER PRIMARY KEY,
-                access_hash INTEGER,
-                type TEXT NOT NULL,
-                username TEXT,
-                phone_number TEXT,
-                last_update_on INTEGER NOT NULL DEFAULT (CAST(STRFTIME('%s', 'now') AS INTEGER))
-            );
-            CREATE TABLE IF NOT EXISTS version (number INTEGER);
-        ''')
-        # version row ensure karo
-        if not con.execute('SELECT * FROM version').fetchone():
-            con.execute('INSERT INTO version VALUES (1)')
-        # version.number column ensure karo
-        vcols = [r[1] for r in con.execute('PRAGMA table_info(version)').fetchall()]
-        if 'number' not in vcols:
-            con.execute('ALTER TABLE version ADD COLUMN number INTEGER DEFAULT 1')
-            if not con.execute('SELECT * FROM version').fetchone():
-                con.execute('INSERT INTO version VALUES (1)')
-        con.commit()
-        con.close()
-    except Exception as e:
-        log.warning(f"Session schema fix error {session_path}: {e}")
+    # ✅ FIX: Proper schema fix before starting client
+    fix_session_schema(str(session_path))
 
     client   = Client(str(session_path.with_suffix("")), api_id=API_ID, api_hash=API_HASH)
     active_listeners[number_id] = client
@@ -1156,7 +1166,6 @@ async def start_otp_listener(bot_app, number_id, buyer_id, number_str):
             await bot_app.bot.send_message(buyer_id, reply, parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="menu:home")]]))
         except Exception as e: log.error(e)
-        # OTP aaya → sold mark karo, order confirm karo
         db_run("UPDATE numbers SET status='sold' WHERE id=?", (number_id,))
         db_run("UPDATE orders SET status='confirmed' WHERE number_id=? AND user_id=?", (number_id, buyer_id))
         received.set()
@@ -1164,13 +1173,13 @@ async def start_otp_listener(bot_app, number_id, buyer_id, number_str):
     client.add_handler(PyroMsgHandler(on_message))
     try:
         await client.start()
-        try: await asyncio.wait_for(received.wait(), timeout=OTP_TIMEOUT)
+        try:
+            await asyncio.wait_for(received.wait(), timeout=OTP_TIMEOUT)
         except asyncio.TimeoutError:
-            # OTP nahi aaya → stock wapas + refund
             db_run("UPDATE numbers SET status='available' WHERE id=?", (number_id,))
             db_run("UPDATE orders SET status='cancelled' WHERE number_id=? AND user_id=?", (number_id, buyer_id))
-            row = db_one("SELECT price FROM numbers WHERE id=?", (number_id,))
-            refund_amt = row["price"] if row else 0
+            refund_row = db_one("SELECT price FROM numbers WHERE id=?", (number_id,))
+            refund_amt = refund_row["price"] if refund_row else 0
             if refund_amt:
                 db_run("UPDATE users SET balance = balance + ? WHERE user_id=?", (refund_amt, buyer_id))
             await bot_app.bot.send_message(buyer_id,
@@ -1192,6 +1201,13 @@ async def start_otp_listener(bot_app, number_id, buyer_id, number_str):
                         f"💰 Refund: ₹{refund_amt}",
                         parse_mode="Markdown")
                 except Exception: pass
+    except Exception as e:
+        log.error(f"OTP listener error for {number_str}: {e}")
+        try:
+            await bot_app.bot.send_message(buyer_id,
+                f"⚠️ *OTP Listener Error!*\n\n`{e}`\n\nAdmin se contact karein.",
+                parse_mode="Markdown")
+        except Exception: pass
     finally:
         try: await client.stop()
         except Exception: pass
