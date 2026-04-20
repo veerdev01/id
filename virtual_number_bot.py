@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Virtual Number Bot – Full UI + Force Join + Wallet + OTP Session
-=================================================================
+Virtual Number Bot – Full UI + Force Join + Wallet + OTP Session + 2FA + Smart Buy Flow
+=========================================================================================
 Install:
   pip install python-telegram-bot==20.7 pyrogram==2.0.106 tgcrypto
 """
@@ -13,6 +13,7 @@ import sqlite3
 from pathlib import Path
 
 from pyrogram import Client
+from pyrogram.errors import SessionPasswordNeeded
 from pyrogram.handlers import MessageHandler as PyroMsgHandler
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -30,14 +31,12 @@ PAYMENT_INFO   = "UPI: solankiraghu7572-1@okhdfcbank"
 API_ID         = 39917988
 API_HASH       = "bd827dbeac6a55896ff11539bc80365b"
 
-# Force Join – apne channel ka username (@ ke bina) ya ID
-FORCE_CHANNEL_USERNAME = "@datacheak"
-FORCE_CHANNEL_LINK     = "https://t.me/datacheak"
-FORCE_CHANNEL_ID       = -1003581162306
+FORCE_CHANNEL_USERNAME = "yourchannel"
+FORCE_CHANNEL_LINK     = "https://t.me/yourchannel"
+FORCE_CHANNEL_ID       = -1001234567890
 
-# Support
-SUPPORT_GROUP_LINK   = "https://t.me/yughumai"
-SUPPORT_CHANNEL_LINK = "https://t.me/datacheak"
+SUPPORT_GROUP_LINK   = "https://t.me/yoursupportgroup"
+SUPPORT_CHANNEL_LINK = "https://t.me/yourchannel"
 
 SESSIONS_DIR = Path("sessions")
 SESSIONS_DIR.mkdir(exist_ok=True)
@@ -62,6 +61,7 @@ def db_init():
         CREATE TABLE IF NOT EXISTS numbers (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
             category     TEXT,
+            country      TEXT DEFAULT 'India',
             number       TEXT UNIQUE,
             price        INTEGER,
             description  TEXT,
@@ -83,6 +83,12 @@ def db_init():
             status    TEXT DEFAULT 'pending'
         );
     """)
+    # Purani DB ke liye country column add karo
+    try:
+        con.execute("ALTER TABLE numbers ADD COLUMN country TEXT DEFAULT 'India'")
+        con.commit()
+    except Exception:
+        pass
     con.commit(); con.close()
 
 db_init()
@@ -117,14 +123,14 @@ def is_admin(uid): return uid in ADMIN_IDS
 # ──────────────────────────────────────────────
 #  CONVERSATION STATES
 # ──────────────────────────────────────────────
-# Add number via OTP flow states
-ADD_CAT, ADD_NUM, ADD_PRICE, ADD_DESC, ADD_OTP_WAIT, REMOVE_ID = range(6)
+# Admin: Add number
+ADD_CAT, ADD_COUNTRY, ADD_NUM, ADD_PRICE, ADD_DESC, ADD_OTP_WAIT, ADD_2FA_WAIT = range(7)
 
-CATEGORIES    = ["WhatsApp", "Telegram", "Instagram", "Gmail", "OTP", "Other"]
+# User: Buy flow
+BUY_SERVICE, BUY_COUNTRY, BUY_QTY, BUY_CONFIRM = range(10, 14)
+
 TOPUP_AMOUNTS = [50, 100, 200, 500, 1000]
-
 active_listeners: dict = {}
-pending_logins:   dict = {}   # number_id -> pyrogram Client (login ke waqt)
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -192,7 +198,7 @@ async def show_main_menu(msg, user, ctx, edit=False):
 
     btns = [
         [
-            InlineKeyboardButton("📱 Numbers Dekho",    callback_data="menu:numbers"),
+            InlineKeyboardButton("🛒 Number Kharido",   callback_data="menu:buynumber"),
             InlineKeyboardButton("💰 Balance Dekho",    callback_data="menu:balance"),
         ],
         [
@@ -204,7 +210,6 @@ async def show_main_menu(msg, user, ctx, edit=False):
             InlineKeyboardButton("📢 Our Channel",      url=SUPPORT_CHANNEL_LINK),
         ],
     ]
-
     if is_admin(user.id):
         btns.append([InlineKeyboardButton("🔐 Admin Panel", callback_data="menu:admin")])
 
@@ -226,29 +231,247 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await show_main_menu(update.message, user, ctx)
 
 # ══════════════════════════════════════════════
+#  USER BUY FLOW – CONVERSATION
+# ══════════════════════════════════════════════
+
+async def buy_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Step 1: Service choose karo (WhatsApp/Telegram etc)"""
+    q = update.callback_query
+    if q: await q.answer()
+    if not await force_join_gate(update, ctx): return ConversationHandler.END
+
+    user = update.effective_user
+    ensure_user(user.id, user.username or user.first_name)
+
+    services = db_all("SELECT DISTINCT category FROM numbers WHERE status='available'")
+    if not services:
+        text   = "😔 *Abhi Koi Number Available Nahi Hai*\n\nBaad mein aayein."
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="menu:home")]])
+        if q: await q.message.edit_text(text, reply_markup=markup, parse_mode="Markdown")
+        else:  await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
+        return ConversationHandler.END
+
+    btns = [[InlineKeyboardButton(s["category"], callback_data=f"bsvc:{s['category']}")] for s in services]
+    btns.append([InlineKeyboardButton("❌ Cancel", callback_data="menu:home")])
+
+    text   = "📱 *Kaunsi Service Chahiye?*\n\nSelect karein 👇"
+    markup = InlineKeyboardMarkup(btns)
+    if q: await q.message.edit_text(text, reply_markup=markup, parse_mode="Markdown")
+    else:  await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
+    return BUY_SERVICE
+
+async def buy_service_chosen(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Step 2: Country choose karo"""
+    q = update.callback_query; await q.answer()
+    service = q.data.split(":", 1)[1]
+    ctx.user_data["buy_service"] = service
+
+    countries = db_all(
+        "SELECT DISTINCT country FROM numbers WHERE status='available' AND category=?", (service,)
+    )
+    if not countries:
+        await q.edit_message_text(
+            f"❌ *{service}* ke liye koi number available nahi.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Back", callback_data="menu:buynumber")]]))
+        return ConversationHandler.END
+
+    btns = [[InlineKeyboardButton(f"🌍 {c['country']}", callback_data=f"bcnt:{c['country']}")] for c in countries]
+    btns.append([InlineKeyboardButton("◀️ Back", callback_data="menu:buynumber")])
+
+    await q.edit_message_text(
+        f"✅ Service: *{service}*\n\n🌍 *Kaunsa Country chahiye?*\n\nSelect karein 👇",
+        reply_markup=InlineKeyboardMarkup(btns), parse_mode="Markdown"
+    )
+    return BUY_COUNTRY
+
+async def buy_country_chosen(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Step 3: Kitne numbers chahiye"""
+    q = update.callback_query; await q.answer()
+    country = q.data.split(":", 1)[1]
+    ctx.user_data["buy_country"] = country
+    service = ctx.user_data["buy_service"]
+
+    nums = db_all(
+        "SELECT * FROM numbers WHERE status='available' AND category=? AND country=?",
+        (service, country)
+    )
+    if not nums:
+        await q.edit_message_text(
+            f"❌ *{country}* mein *{service}* ke liye koi number available nahi.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Back", callback_data="menu:buynumber")]]))
+        return ConversationHandler.END
+
+    price       = nums[0]["price"]
+    available   = len(nums)
+    bal         = get_balance(update.effective_user.id)
+    max_can_buy = min(available, bal // price, 5)
+
+    ctx.user_data["buy_price"]     = price
+    ctx.user_data["buy_available"] = available
+
+    if max_can_buy == 0:
+        await q.edit_message_text(
+            f"❌ *Balance Kam Hai!*\n\n"
+            f"💰 Aapka Balance: ₹{bal}\n"
+            f"🏷 Price per number: ₹{price}\n\n"
+            f"Pehle balance add karein 👇",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Balance Add Karo", callback_data="menu:addbalance")],
+                [InlineKeyboardButton("🏠 Main Menu",        callback_data="menu:home")],
+            ])
+        )
+        return ConversationHandler.END
+
+    btns = [[InlineKeyboardButton(
+        f"{i} Number{'s' if i > 1 else ''} – ₹{i * price}",
+        callback_data=f"bqty:{i}"
+    )] for i in range(1, max_can_buy + 1)]
+    btns.append([InlineKeyboardButton("◀️ Back", callback_data="menu:buynumber")])
+
+    await q.edit_message_text(
+        f"✅ Service: *{service}* | Country: *{country}*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 Price: ₹{price} per number\n"
+        f"📦 Available: {available}\n"
+        f"💳 Aapka Balance: ₹{bal}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"*Kitne numbers chahiye?* 👇",
+        reply_markup=InlineKeyboardMarkup(btns), parse_mode="Markdown"
+    )
+    return BUY_QTY
+
+async def buy_qty_chosen(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Step 4: Confirm"""
+    q = update.callback_query; await q.answer()
+    qty     = int(q.data.split(":")[1])
+    service = ctx.user_data["buy_service"]
+    country = ctx.user_data["buy_country"]
+    price   = ctx.user_data["buy_price"]
+    total   = qty * price
+    bal     = get_balance(update.effective_user.id)
+    ctx.user_data["buy_qty"] = qty
+
+    await q.edit_message_text(
+        f"🛒 *Purchase Confirm Karein*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📱 Service: *{service}*\n"
+        f"🌍 Country: *{country}*\n"
+        f"🔢 Quantity: *{qty}*\n"
+        f"💰 Price: ₹{price} × {qty} = *₹{total}*\n"
+        f"💳 Balance baad mein: ₹{bal - total}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Confirm karein? 👇",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"✅ Confirm – ₹{total} Pay", callback_data="bconfirm:yes")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="menu:home")],
+        ])
+    )
+    return BUY_CONFIRM
+
+async def buy_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Step 5: Purchase complete"""
+    q = update.callback_query; await q.answer()
+    user    = q.from_user
+    service = ctx.user_data["buy_service"]
+    country = ctx.user_data["buy_country"]
+    price   = ctx.user_data["buy_price"]
+    qty     = ctx.user_data["buy_qty"]
+    total   = qty * price
+    bal     = get_balance(user.id)
+
+    if bal < total:
+        await q.edit_message_text("❌ *Balance Kam Ho Gaya!*\n\nPehle balance add karein.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ Balance Add Karo", callback_data="menu:addbalance")]]))
+        return ConversationHandler.END
+
+    nums = db_all(
+        "SELECT * FROM numbers WHERE status='available' AND category=? AND country=? LIMIT ?",
+        (service, country, qty)
+    )
+    if len(nums) < qty:
+        await q.edit_message_text(
+            f"❌ Sirf *{len(nums)}* number available hai abhi.\n\nDobara try karein.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="menu:home")]]))
+        return ConversationHandler.END
+
+    db_run("UPDATE users SET balance = balance - ? WHERE user_id=?", (total, user.id))
+
+    bought = []
+    for n in nums:
+        db_run("UPDATE numbers SET status='sold' WHERE id=?", (n["id"],))
+        db_insert("INSERT INTO orders (user_id,username,number_id,status) VALUES (?,?,?,'confirmed')",
+                  (user.id, user.username or user.first_name, n["id"]))
+        bought.append(n)
+
+    new_bal = get_balance(user.id)
+    text = (
+        f"🎉 *Purchase Successful!*\n\n"
+        f"📱 Service: *{service}*\n"
+        f"🌍 Country: *{country}*\n"
+        f"💰 Paid: ₹{total}\n"
+        f"💳 Remaining Balance: ₹{new_bal}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📞 *Aapke Numbers:*\n"
+    )
+    for i, n in enumerate(bought, 1):
+        text += f"{i}. `{n['number']}`\n"
+    text += f"\n⏳ OTP listener start ho gaya...\nMessage/OTP aane pe turant notify karunga! 🚀"
+
+    await q.edit_message_text(text, parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📦 Mere Orders", callback_data="menu:myorders")],
+            [InlineKeyboardButton("🏠 Main Menu",   callback_data="menu:home")],
+        ])
+    )
+
+    for aid in ADMIN_IDS:
+        try:
+            await ctx.bot.send_message(aid,
+                f"🛒 *Naya Purchase!*\n"
+                f"👤 @{user.username or user.first_name} | `{user.id}`\n"
+                f"📱 {service} | 🌍 {country} | {qty} numbers | ₹{total}",
+                parse_mode="Markdown")
+        except Exception: pass
+
+    for n in bought:
+        asyncio.create_task(start_otp_listener(ctx.application, n["id"], user.id, n["number"]))
+
+    return ConversationHandler.END
+
+async def buy_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    markup = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="menu:home")]])
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.message.edit_text("❌ Cancel ho gaya.", reply_markup=markup)
+    else:
+        await update.message.reply_text("❌ Cancel ho gaya.", reply_markup=markup)
+    return ConversationHandler.END
+
+# ══════════════════════════════════════════════
 #  MENU CALLBACKS
 # ══════════════════════════════════════════════
 
 async def cb_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q      = update.callback_query; await q.answer()
-    user   = q.from_user
-
+    q    = update.callback_query; await q.answer()
+    user = q.from_user
     if not await force_join_gate(update, ctx): return
-
     action = q.data.split(":")[1]
 
-    if action == "numbers":
-        await show_numbers_menu(q.message, user, ctx, edit=True)
+    if action == "buynumber":
+        await buy_start(update, ctx)
 
     elif action == "balance":
-        bal  = get_balance(user.id)
-        btns = InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Balance Add Karo", callback_data="menu:addbalance")],
-            [InlineKeyboardButton("🏠 Main Menu",        callback_data="menu:home")],
-        ])
+        bal = get_balance(user.id)
         await q.message.edit_text(
             f"💰 *Aapka Balance*\n\nAvailable: *₹{bal}*\n\nBalance add karne ke liye niche button dabayein. 👇",
-            reply_markup=btns, parse_mode="Markdown"
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Balance Add Karo", callback_data="menu:addbalance")],
+                [InlineKeyboardButton("🏠 Main Menu",        callback_data="menu:home")],
+            ]), parse_mode="Markdown"
         )
 
     elif action == "addbalance":
@@ -263,18 +486,19 @@ async def cb_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif action == "myorders":
         rows = db_all(
-            "SELECT o.*,n.number,n.price,n.category FROM orders o JOIN numbers n ON o.number_id=n.id WHERE o.user_id=?",
+            "SELECT o.*,n.number,n.price,n.category,n.country FROM orders o JOIN numbers n ON o.number_id=n.id WHERE o.user_id=?",
             (user.id,)
         )
         if not rows:
-            text = "📭 *Aapka Koi Order Nahi Hai*\n\nNumbers khareedne ke liye 'Numbers Dekho' dabayein."
+            text = "📭 *Aapka Koi Order Nahi Hai*\n\nNumbers khareedne ke liye 'Number Kharido' dabayein."
         else:
             emo  = {"pending": "⏳", "confirmed": "✅", "cancelled": "❌"}
             text = "📦 *Aapke Orders:*\n\n"
             for o in rows:
-                text += f"{emo.get(o['status'], '✅')} `#{o['id']}` | {o['category']} | `{o['number']}` | ₹{o['price']}\n"
-        btns = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="menu:home")]])
-        await q.message.edit_text(text, reply_markup=btns, parse_mode="Markdown")
+                text += f"{emo.get(o['status'],'✅')} `#{o['id']}` | {o['category']} | {o['country']} | `{o['number']}` | ₹{o['price']}\n"
+        await q.message.edit_text(text,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="menu:home")]]),
+            parse_mode="Markdown")
 
     elif action == "home":
         await show_main_menu(q.message, user, ctx, edit=True)
@@ -283,137 +507,6 @@ async def cb_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not is_admin(user.id):
             await q.answer("❌ Permission nahi.", show_alert=True); return
         await show_admin_panel(q.message, ctx)
-
-# ══════════════════════════════════════════════
-#  NUMBERS UI
-# ══════════════════════════════════════════════
-
-async def show_numbers_menu(msg, user, ctx, edit=False):
-    nums = db_all("SELECT * FROM numbers WHERE status='available'")
-    bal  = get_balance(user.id)
-
-    if not nums:
-        btns = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="menu:home")]])
-        text = "😔 *Abhi Koi Number Available Nahi Hai*\n\nBaad mein aayein ya support se contact karein."
-        if edit: await msg.edit_text(text, reply_markup=btns, parse_mode="Markdown")
-        else:    await msg.reply_text(text, reply_markup=btns, parse_mode="Markdown")
-        return
-
-    cats = sorted({n["category"] for n in nums})
-    btns = []; row = []
-    for i, c in enumerate(cats):
-        count = len([n for n in nums if n["category"] == c])
-        row.append(InlineKeyboardButton(f"📂 {c} ({count})", callback_data=f"cat:{c}"))
-        if len(row) == 2: btns.append(row); row = []
-    if row: btns.append(row)
-    btns.append([InlineKeyboardButton("📋 Sab Numbers", callback_data="cat:ALL")])
-    btns.append([InlineKeyboardButton("🏠 Main Menu",   callback_data="menu:home")])
-
-    text = (
-        f"📱 *Available Numbers*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"💰 Aapka Balance: *₹{bal}*\n"
-        f"✅ Total Available: *{len(nums)}*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"Category choose karein 👇"
-    )
-    if edit: await msg.edit_text(text, reply_markup=InlineKeyboardMarkup(btns), parse_mode="Markdown")
-    else:    await msg.reply_text(text, reply_markup=InlineKeyboardMarkup(btns), parse_mode="Markdown")
-
-async def cb_category(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    if not await force_join_gate(update, ctx): return
-
-    cat  = q.data.split(":", 1)[1]
-    user = q.from_user
-    nums = (db_all("SELECT * FROM numbers WHERE status='available'")
-            if cat == "ALL"
-            else db_all("SELECT * FROM numbers WHERE status='available' AND category=?", (cat,)))
-    bal  = get_balance(user.id)
-
-    if not nums:
-        await q.edit_message_text("❌ Is category mein koi number nahi."); return
-
-    text = (
-        f"📂 *{cat} Numbers*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"💰 Aapka Balance: *₹{bal}*\n"
-        f"✅ Available: *{len(nums)}*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-    )
-    btns = []
-    for n in nums:
-        can   = bal >= n["price"]
-        text += f"🔢 `#{n['id']}` | 📞 `{n['number']}` | 💰 ₹{n['price']}\n📝 {n['description']}\n\n"
-        label = f"🛒 Buy #{n['id']} – ₹{n['price']}" if can else f"❌ #{n['id']} – ₹{n['price']} (Balance kam)"
-        btns.append([InlineKeyboardButton(label, callback_data=f"buy:{n['id']}")])
-
-    btns.append([
-        InlineKeyboardButton("◀️ Wapas", callback_data="menu:numbers"),
-        InlineKeyboardButton("🏠 Home",  callback_data="menu:home"),
-    ])
-    await q.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(btns))
-
-async def cb_buy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    if not await force_join_gate(update, ctx): return
-
-    user = q.from_user
-    ensure_user(user.id, user.username or user.first_name)
-    nid  = int(q.data.split(":")[1])
-    n    = db_one("SELECT * FROM numbers WHERE id=? AND status='available'", (nid,))
-
-    if not n:
-        await q.edit_message_text("❌ Number already sold ya exist nahi karta."); return
-
-    bal = get_balance(user.id)
-    if bal < n["price"]:
-        short = n["price"] - bal
-        await q.edit_message_text(
-            f"❌ *Balance Kam Hai!*\n\n"
-            f"💰 Aapka Balance: ₹{bal}\n"
-            f"🏷 Number Price: ₹{n['price']}\n"
-            f"💸 Aur Chahiye: *₹{short}*\n\n"
-            f"Pehle balance add karein 👇",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("➕ Balance Add Karo", callback_data="menu:addbalance")],
-                [InlineKeyboardButton("🏠 Main Menu",        callback_data="menu:home")],
-            ])
-        ); return
-
-    db_run("UPDATE users SET balance = balance - ? WHERE user_id=?", (n["price"], user.id))
-    db_run("UPDATE numbers SET status='sold' WHERE id=?", (nid,))
-    oid     = db_insert(
-        "INSERT INTO orders (user_id,username,number_id,status) VALUES (?,?,?,'confirmed')",
-        (user.id, user.username or user.first_name, nid)
-    )
-    new_bal = get_balance(user.id)
-
-    await q.edit_message_text(
-        f"🎉 *Purchase Successful!*\n\n"
-        f"📞 Number: `{n['number']}`\n"
-        f"📱 Category: {n['category']}\n"
-        f"💰 Price Paid: ₹{n['price']}\n"
-        f"💳 Remaining Balance: ₹{new_bal}\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"⏳ OTP listener start ho gaya...\n"
-        f"Jaise hi OTP/SMS aayega, *turant* aapko milega! 🚀",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("📦 Mere Orders", callback_data="menu:myorders")],
-            [InlineKeyboardButton("🏠 Main Menu",   callback_data="menu:home")],
-        ])
-    )
-
-    for aid in ADMIN_IDS:
-        try:
-            await ctx.bot.send_message(aid,
-                f"🛒 *Naya Purchase!*\n👤 @{user.username or user.first_name}\n"
-                f"📞 `{n['number']}` | ₹{n['price']}", parse_mode="Markdown")
-        except Exception: pass
-
-    asyncio.create_task(start_otp_listener(ctx.application, nid, user.id, n["number"]))
 
 # ══════════════════════════════════════════════
 #  TOPUP
@@ -439,7 +532,7 @@ async def cb_topup_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Admin confirm karega, balance add ho jayega! ✅",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("💬 Support",  url=SUPPORT_GROUP_LINK)],
+            [InlineKeyboardButton("💬 Support",   url=SUPPORT_GROUP_LINK)],
             [InlineKeyboardButton("🏠 Main Menu", callback_data="menu:home")],
         ])
     )
@@ -470,7 +563,7 @@ async def handle_screenshot(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "⏳ Admin confirm karega, balance add ho jayega.\n"
         "Phir /start se numbers khareed sakte ho! 🎉",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("💬 Support",  url=SUPPORT_GROUP_LINK)],
+            [InlineKeyboardButton("💬 Support",   url=SUPPORT_GROUP_LINK)],
             [InlineKeyboardButton("🏠 Main Menu", callback_data="menu:home")],
         ])
     )
@@ -495,17 +588,15 @@ async def show_admin_panel(msg, ctx):
     )
     btns = [
         [
-            InlineKeyboardButton("➕ Number Add (OTP)",  callback_data="admin:addnumber"),
-            InlineKeyboardButton("🗑 Number Hatao",       callback_data="admin:removenumber"),
+            InlineKeyboardButton("➕ Number Add (OTP)", callback_data="admin:addnumber"),
+            InlineKeyboardButton("🗑 Number Hatao",      callback_data="admin:removenumber"),
         ],
         [
-            InlineKeyboardButton("📋 Saare Orders",       callback_data="admin:orders"),
-            InlineKeyboardButton("💰 Pending Top-ups",    callback_data="admin:topuprequests"),
+            InlineKeyboardButton("📋 Saare Orders",      callback_data="admin:orders"),
+            InlineKeyboardButton("💰 Pending Top-ups",   callback_data="admin:topuprequests"),
         ],
-        [
-            InlineKeyboardButton("📁 Sessions List",      callback_data="admin:sessions"),
-        ],
-        [InlineKeyboardButton("🏠 Main Menu",             callback_data="menu:home")],
+        [InlineKeyboardButton("📁 Sessions List",        callback_data="admin:sessions")],
+        [InlineKeyboardButton("🏠 Main Menu",            callback_data="menu:home")],
     ]
     await msg.edit_text(text, reply_markup=InlineKeyboardMarkup(btns), parse_mode="Markdown")
 
@@ -516,33 +607,25 @@ async def cb_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     action = q.data.split(":")[1]
 
-    if action == "addnumber":
-        btns = [[InlineKeyboardButton(c, callback_data=f"setcat:{c}")] for c in CATEGORIES]
-        btns.append([InlineKeyboardButton("❌ Cancel", callback_data="menu:admin")])
-        await q.edit_message_text(
-            "➕ *Naya Number Add (OTP se)*\n\nPehle category choose karein:",
-            reply_markup=InlineKeyboardMarkup(btns), parse_mode="Markdown"
-        )
-
-    elif action == "removenumber":
-        nums = db_all("SELECT id,number,category,price FROM numbers")
+    if action == "removenumber":
+        nums = db_all("SELECT id,number,category,country,price FROM numbers")
         if not nums:
             await q.edit_message_text("📭 Koi number nahi.",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Back", callback_data="menu:admin")]])); return
         btns = [[InlineKeyboardButton(
-            f"🗑 #{n['id']} {n['category']} {n['number']} ₹{n['price']}",
+            f"🗑 #{n['id']} {n['category']} {n['country']} {n['number']} ₹{n['price']}",
             callback_data=f"del:{n['id']}")] for n in nums]
         btns.append([InlineKeyboardButton("◀️ Back", callback_data="menu:admin")])
         await q.edit_message_text("🗑 *Kaun sa number hatana hai?*",
                                   reply_markup=InlineKeyboardMarkup(btns), parse_mode="Markdown")
 
     elif action == "orders":
-        rows = db_all("SELECT o.*,n.number,n.price FROM orders o JOIN numbers n ON o.number_id=n.id")
+        rows = db_all("SELECT o.*,n.number,n.price,n.country FROM orders o JOIN numbers n ON o.number_id=n.id")
         text = "📋 *Saare Orders:*\n\n"
         if not rows: text += "Koi order nahi."
         else:
             for o in rows:
-                text += f"`#{o['id']}` @{o['username']} | `{o['number']}` | ₹{o['price']} | *{o['status']}*\n"
+                text += f"`#{o['id']}` @{o['username']} | `{o['number']}` | {o['country']} | ₹{o['price']} | *{o['status']}*\n"
         await q.edit_message_text(text, parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Back", callback_data="menu:admin")]]))
 
@@ -563,8 +646,8 @@ async def cb_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not files: text += "Koi session nahi."
         else:
             for f in files:
-                row  = db_one("SELECT number,status FROM numbers WHERE session_file=?", (f.name,))
-                info = f"`{row['number']}` – {row['status']}" if row else "unlinked"
+                row  = db_one("SELECT number,status,country FROM numbers WHERE session_file=?", (f.name,))
+                info = f"`{row['number']}` ({row['country']}) – {row['status']}" if row else "unlinked"
                 text += f"• `{f.name}` → {info}\n"
         await q.edit_message_text(text, parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Back", callback_data="menu:admin")]]))
@@ -583,18 +666,28 @@ async def cb_delete_number(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await show_admin_panel(q.message, ctx)
 
 # ══════════════════════════════════════════════
-#  ADD NUMBER VIA OTP – CONVERSATION FLOW
+#  ADMIN: ADD NUMBER VIA OTP + 2FA FLOW
 # ══════════════════════════════════════════════
 
 async def admin_addnumber_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ Permission nahi."); return ConversationHandler.END
-    btns = [[InlineKeyboardButton(c, callback_data=f"setcat:{c}")] for c in CATEGORIES]
+        if update.message:
+            await update.message.reply_text("❌ Permission nahi.")
+        elif update.callback_query:
+            await update.callback_query.answer("❌ Permission nahi.", show_alert=True)
+        return ConversationHandler.END
+
+    cats   = ["WhatsApp", "Telegram", "Instagram", "Gmail", "OTP", "Other"]
+    btns   = [[InlineKeyboardButton(c, callback_data=f"setcat:{c}")] for c in cats]
     btns.append([InlineKeyboardButton("❌ Cancel", callback_data="menu:admin")])
-    await update.message.reply_text(
-        "➕ *Naya Number Add (OTP se)*\n\nCategory choose karein:",
-        reply_markup=InlineKeyboardMarkup(btns), parse_mode="Markdown"
-    )
+    text   = "➕ *Naya Number Add (OTP se)*\n\nCategory choose karein:"
+    markup = InlineKeyboardMarkup(btns)
+
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
     return ADD_CAT
 
 async def add_cat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -602,16 +695,23 @@ async def add_cat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["cat"] = q.data.split(":")[1]
     await q.edit_message_text(
         f"✅ Category: *{ctx.user_data['cat']}*\n\n"
-        f"📞 Ab phone number dalein jisme OTP bhejana hai:\n"
-        f"_(Format: +91XXXXXXXXXX)_",
+        f"🌍 *Country name dalein* (e.g. India, USA, UK):",
+        parse_mode="Markdown"
+    )
+    return ADD_COUNTRY
+
+async def add_country(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data["country"] = update.message.text.strip()
+    await update.message.reply_text(
+        f"✅ Country: *{ctx.user_data['country']}*\n\n"
+        f"📞 Phone number dalein (+91XXXXXXXXXX):",
         parse_mode="Markdown"
     )
     return ADD_NUM
 
 async def add_num(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    phone = update.message.text.strip()
-    ctx.user_data["number"] = phone
-    await update.message.reply_text("💰 Is number ki price dalein (e.g. 99):")
+    ctx.user_data["number"] = update.message.text.strip()
+    await update.message.reply_text("💰 Price dalein (e.g. 99):")
     return ADD_PRICE
 
 async def add_price(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -623,32 +723,27 @@ async def add_price(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def add_desc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["desc"] = update.message.text.strip()
-
     phone = ctx.user_data["number"]
+
     await update.message.reply_text(
-        f"📲 *OTP Bheja Ja Raha Hai...*\n\n"
-        f"📞 Number: `{phone}`\n\n"
-        f"⏳ Please wait...",
+        f"📲 *OTP Bheja Ja Raha Hai...*\n\n📞 Number: `{phone}`\n\n⏳ Please wait...",
         parse_mode="Markdown"
     )
 
-    # Pyrogram client banao aur OTP bhejo
-    safe_name  = phone.replace("+", "").replace(" ", "")
+    safe_name    = phone.replace("+", "").replace(" ", "")
     session_path = str(SESSIONS_DIR / safe_name)
 
     try:
         client = Client(session_path, api_id=API_ID, api_hash=API_HASH)
         await client.connect()
-        sent   = await client.send_code(phone)
+        sent = await client.send_code(phone)
         ctx.user_data["phone_code_hash"] = sent.phone_code_hash
         ctx.user_data["session_path"]    = session_path
         ctx.user_data["safe_name"]       = safe_name
-        ctx.user_data["pyro_client"]     = client  # client save karo
+        ctx.user_data["pyro_client"]     = client
 
         await update.message.reply_text(
-            f"✅ *OTP Bhej Diya!*\n\n"
-            f"📞 `{phone}` pe OTP aaya hoga.\n\n"
-            f"🔢 Woh OTP yahan type karein:",
+            f"✅ *OTP Bhej Diya!*\n\n📞 `{phone}` pe OTP aaya hoga.\n\n🔢 OTP type karein:",
             parse_mode="Markdown"
         )
         return ADD_OTP_WAIT
@@ -656,8 +751,7 @@ async def add_desc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.error(f"OTP send error: {e}")
         await update.message.reply_text(
-            f"❌ *OTP Bhejne Mein Error!*\n\n`{e}`\n\n"
-            f"Check karein:\n• Number sahi hai?\n• API ID/Hash sahi hai?\n• Number Telegram pe registered hai?",
+            f"❌ *OTP Bhejne Mein Error!*\n\n`{e}`",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Admin Panel", callback_data="menu:admin")]]))
         return ConversationHandler.END
@@ -668,7 +762,7 @@ async def add_otp_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     client = ctx.user_data.get("pyro_client")
 
     if not client:
-        await update.message.reply_text("❌ Session expire ho gaya. Dobara /addnumber try karein.")
+        await update.message.reply_text("❌ Session expire. Dobara /addnumber try karein.")
         return ConversationHandler.END
 
     await update.message.reply_text("⏳ Verify ho raha hai...")
@@ -679,66 +773,106 @@ async def add_otp_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             phone_code_hash = ctx.user_data["phone_code_hash"],
             phone_code      = otp
         )
-        await client.disconnect()
+        await _save_number_session(update, ctx, client)
+        return ConversationHandler.END
 
-        safe_name    = ctx.user_data["safe_name"]
-        session_file = f"{safe_name}.session"
-
-        # DB mein save karo
-        nid = db_insert(
-            "INSERT INTO numbers (category,number,price,description,session_file,status) VALUES (?,?,?,?,?,'available')",
-            (ctx.user_data["cat"], phone, ctx.user_data["price"],
-             ctx.user_data["desc"], session_file)
-        )
-
+    except SessionPasswordNeeded:
         await update.message.reply_text(
-            f"🎉 *Number Successfully Add Ho Gaya!*\n\n"
-            f"🆔 ID: `{nid}`\n"
-            f"📞 Number: `{phone}`\n"
-            f"📂 Category: {ctx.user_data['cat']}\n"
-            f"💰 Price: ₹{ctx.user_data['price']}\n"
-            f"📁 Session: `{session_file}`\n\n"
-            f"✅ Session `sessions/` folder mein save ho gaya!",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("➕ Aur Number Add", callback_data="admin:addnumber")],
-                [InlineKeyboardButton("🔐 Admin Panel",    callback_data="menu:admin")],
-            ])
+            "🔐 *2FA (Two-Step Verification) On Hai!*\n\n"
+            "Is number ka 2FA password dalein 👇",
+            parse_mode="Markdown"
         )
+        return ADD_2FA_WAIT
 
     except Exception as e:
-        log.error(f"OTP verify error: {e}")
         err = str(e)
         if "PHONE_CODE_INVALID" in err:
-            msg = "❌ *OTP Galat Hai!*\n\nSahi OTP dalein:"
-            await update.message.reply_text(msg, parse_mode="Markdown")
-            return ADD_OTP_WAIT  # dobara try karne do
+            await update.message.reply_text("❌ *OTP Galat Hai!*\n\nSahi OTP dalein:", parse_mode="Markdown")
+            return ADD_OTP_WAIT
         elif "PHONE_CODE_EXPIRED" in err:
             msg = "⏰ *OTP Expire Ho Gaya!*\n\n/addnumber se dobara try karein."
-        elif "SESSION_PASSWORD_NEEDED" in err:
-            msg = "🔐 *2FA Password Laga Hua Hai!*\n\nIs number ki 2FA (Two-Step Verification) on hai.\nPehle 2FA band karein, phir add karein."
         else:
             msg = f"❌ *Error:* `{err}`"
-
         try: await client.disconnect()
         except: pass
-
+        ctx.user_data.pop("pyro_client", None)
         await update.message.reply_text(msg, parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Admin Panel", callback_data="menu:admin")]]))
+        return ConversationHandler.END
 
-    # cleanup
+async def add_2fa_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """2FA password verify karo"""
+    password = update.message.text.strip()
+    client   = ctx.user_data.get("pyro_client")
+
+    if not client:
+        await update.message.reply_text("❌ Session expire. Dobara /addnumber try karein.")
+        return ConversationHandler.END
+
+    await update.message.reply_text("⏳ 2FA verify ho raha hai...")
+
+    try:
+        await client.check_password(password)
+        await _save_number_session(update, ctx, client)
+        return ConversationHandler.END
+
+    except Exception as e:
+        err = str(e)
+        if "PASSWORD_HASH_INVALID" in err:
+            await update.message.reply_text(
+                "❌ *2FA Password Galat Hai!*\n\nSahi password dalein:",
+                parse_mode="Markdown"
+            )
+            return ADD_2FA_WAIT
+        try: await client.disconnect()
+        except: pass
+        ctx.user_data.pop("pyro_client", None)
+        await update.message.reply_text(f"❌ *2FA Error:* `{err}`", parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Admin Panel", callback_data="menu:admin")]]))
+        return ConversationHandler.END
+
+async def _save_number_session(update, ctx, client):
+    """Session save karo DB mein"""
+    phone        = ctx.user_data["number"]
+    safe_name    = ctx.user_data["safe_name"]
+    session_file = f"{safe_name}.session"
+
+    await client.disconnect()
+
+    nid = db_insert(
+        "INSERT INTO numbers (category,country,number,price,description,session_file,status) VALUES (?,?,?,?,?,?,'available')",
+        (ctx.user_data["cat"], ctx.user_data["country"], phone,
+         ctx.user_data["price"], ctx.user_data["desc"], session_file)
+    )
+
+    await update.message.reply_text(
+        f"🎉 *Number Successfully Add Ho Gaya!*\n\n"
+        f"🆔 ID: `{nid}`\n"
+        f"📞 Number: `{phone}`\n"
+        f"📂 Category: {ctx.user_data['cat']}\n"
+        f"🌍 Country: {ctx.user_data['country']}\n"
+        f"💰 Price: ₹{ctx.user_data['price']}\n"
+        f"📁 Session: `{session_file}`\n\n"
+        f"✅ Session save ho gaya!",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Aur Number Add", callback_data="admin:addnumber")],
+            [InlineKeyboardButton("🔐 Admin Panel",    callback_data="menu:admin")],
+        ])
+    )
     ctx.user_data.pop("pyro_client", None)
     ctx.user_data.pop("phone_code_hash", None)
-    return ConversationHandler.END
 
 async def cancel_conv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # Client agar connected hai toh disconnect karo
     client = ctx.user_data.pop("pyro_client", None)
     if client:
         try: await client.disconnect()
         except: pass
-    await update.message.reply_text("❌ Cancel ho gaya.",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Admin Panel", callback_data="menu:admin")]]))
+    markup = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Admin Panel", callback_data="menu:admin")]])
+    if update.message:
+        await update.message.reply_text("❌ Cancel ho gaya.", reply_markup=markup)
+    elif update.callback_query:
+        await update.callback_query.message.reply_text("❌ Cancel ho gaya.", reply_markup=markup)
     return ConversationHandler.END
 
 # ══════════════════════════════════════════════
@@ -766,7 +900,7 @@ async def admin_topup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"💳 New Balance: *₹{new_bal}*\n\n"
             f"Ab /start se number khareedein! 🛒",
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛒 Numbers Dekho", callback_data="menu:numbers")]]))
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛒 Number Kharido", callback_data="menu:buynumber")]]))
     except Exception: pass
     await update.message.reply_text(f"✅ User `{uid}` ko ₹{amount} add. New balance: ₹{new_bal}", parse_mode="Markdown")
 
@@ -818,24 +952,47 @@ async def start_otp_listener(bot_app, number_id, buyer_id, number_str):
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # OTP-based add number conversation
+    # Admin: Add number (OTP + 2FA support)
     add_conv = ConversationHandler(
         entry_points=[
             CommandHandler("addnumber", admin_addnumber_cmd),
-            CallbackQueryHandler(lambda u, c: admin_addnumber_cmd(u, c), pattern="^admin:addnumber$"),
+            CallbackQueryHandler(admin_addnumber_cmd, pattern="^admin:addnumber$"),
         ],
         states={
-            ADD_CAT:      [CallbackQueryHandler(add_cat,          pattern="^setcat:")],
+            ADD_CAT:      [CallbackQueryHandler(add_cat,       pattern="^setcat:")],
+            ADD_COUNTRY:  [MessageHandler(filters.TEXT & ~filters.COMMAND, add_country)],
             ADD_NUM:      [MessageHandler(filters.TEXT & ~filters.COMMAND, add_num)],
             ADD_PRICE:    [MessageHandler(filters.TEXT & ~filters.COMMAND, add_price)],
             ADD_DESC:     [MessageHandler(filters.TEXT & ~filters.COMMAND, add_desc)],
             ADD_OTP_WAIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_otp_received)],
+            ADD_2FA_WAIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_2fa_received)],
         },
         fallbacks=[CommandHandler("cancel", cancel_conv)],
         allow_reentry=True,
+        per_message=False,
     )
 
-    app.add_handler(add_conv)  # ← pehle add karo (priority)
+    # User: Buy number flow
+    buy_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(buy_start, pattern="^menu:buynumber$"),
+        ],
+        states={
+            BUY_SERVICE: [CallbackQueryHandler(buy_service_chosen, pattern="^bsvc:")],
+            BUY_COUNTRY: [CallbackQueryHandler(buy_country_chosen, pattern="^bcnt:")],
+            BUY_QTY:     [CallbackQueryHandler(buy_qty_chosen,     pattern="^bqty:")],
+            BUY_CONFIRM: [CallbackQueryHandler(buy_confirm,        pattern="^bconfirm:")],
+        },
+        fallbacks=[
+            CommandHandler("cancel", buy_cancel),
+            CallbackQueryHandler(buy_cancel, pattern="^menu:home$"),
+        ],
+        allow_reentry=True,
+        per_message=False,
+    )
+
+    app.add_handler(add_conv)
+    app.add_handler(buy_conv)
 
     app.add_handler(CommandHandler("start",     cmd_start))
     app.add_handler(CommandHandler("topup",     admin_topup))
@@ -843,8 +1000,6 @@ def main():
 
     app.add_handler(CallbackQueryHandler(cb_check_join,    pattern="^check_join$"))
     app.add_handler(CallbackQueryHandler(cb_menu,          pattern="^menu:"))
-    app.add_handler(CallbackQueryHandler(cb_category,      pattern="^cat:"))
-    app.add_handler(CallbackQueryHandler(cb_buy,           pattern="^buy:"))
     app.add_handler(CallbackQueryHandler(cb_topup_amount,  pattern="^topup:"))
     app.add_handler(CallbackQueryHandler(cb_admin,         pattern="^admin:"))
     app.add_handler(CallbackQueryHandler(cb_delete_number, pattern="^del:"))
