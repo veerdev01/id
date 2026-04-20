@@ -769,6 +769,18 @@ async def zip_price_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     session_files = list(extract_dir.glob("*.session"))
     added = 0; skipped = 0
 
+    # Purani Pyrogram schema fix karo (no such column: number)
+    for sf in session_files:
+        try:
+            con = sqlite3.connect(str(sf))
+            cols = [r[1] for r in con.execute('PRAGMA table_info(sessions)').fetchall()]
+            if 'number' not in cols:
+                con.execute('ALTER TABLE sessions ADD COLUMN number TEXT')
+                con.commit()
+            con.close()
+        except Exception:
+            pass
+
     for sf in session_files:
         phone        = sf.stem
         session_rel  = f"{platform}/{country}/{sf.name}"
