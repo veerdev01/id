@@ -1082,6 +1082,17 @@ async def start_otp_listener(bot_app, number_id, buyer_id, number_str):
     if not session_path.exists():
         await bot_app.bot.send_message(buyer_id, "❌ Session file disk pe nahi hai."); return
 
+    # Schema fix karo client start se pehle
+    try:
+        con = sqlite3.connect(str(session_path))
+        cols = [r[1] for r in con.execute('PRAGMA table_info(sessions)').fetchall()]
+        if 'number' not in cols:
+            con.execute('ALTER TABLE sessions ADD COLUMN number TEXT')
+            con.commit()
+        con.close()
+    except Exception:
+        pass
+
     client   = Client(str(session_path.with_suffix("")), api_id=API_ID, api_hash=API_HASH)
     active_listeners[number_id] = client
     received = asyncio.Event()
