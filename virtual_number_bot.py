@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Virtual Number Bot – Full UI + Force Join + Wallet + OTP Session + 2FA + Smart Buy Flow
-=========================================================================================
+Virtual Number Bot – Full UI + Force Join + Wallet + OTP Session + 2FA + Smart Buy Flow + Bulk ZIP Upload
+==========================================================================================================
 Install:
   pip install python-telegram-bot==20.7 pyrogram==2.0.106 tgcrypto
 """
@@ -10,6 +10,7 @@ import asyncio
 import logging
 import re
 import sqlite3
+import zipfile
 from pathlib import Path
 
 from pyrogram import Client
@@ -23,7 +24,7 @@ from telegram.ext import (
 )
 
 # ──────────────────────────────────────────────
-#  CONFIG  ← Yahan apni details bharo
+#  CONFIG
 # ──────────────────────────────────────────────
 BOT_TOKEN      = "8374340113:AAElS1BoY4qIL7yt-Tcq_pbVRJc07gG1q6A"
 ADMIN_IDS      = [8263530800]
@@ -31,12 +32,10 @@ PAYMENT_INFO   = "UPI: solankiraghu7572-1@okhdfcbank"
 API_ID         = 39917988
 API_HASH       = "bd827dbeac6a55896ff11539bc80365b"
 
-# Force Join – apne channel ka username (@ ke bina) ya ID
 FORCE_CHANNEL_USERNAME = "@datacheak"
 FORCE_CHANNEL_LINK     = "https://t.me/datacheak"
 FORCE_CHANNEL_ID       = -1003581162306
 
-# Support
 SUPPORT_GROUP_LINK   = "https://t.me/yughumai"
 SUPPORT_CHANNEL_LINK = "https://t.me/datacheak"
 
@@ -85,7 +84,6 @@ def db_init():
             status    TEXT DEFAULT 'pending'
         );
     """)
-    # Purani DB ke liye country column add karo
     try:
         con.execute("ALTER TABLE numbers ADD COLUMN country TEXT DEFAULT 'India'")
         con.commit()
@@ -125,11 +123,14 @@ def is_admin(uid): return uid in ADMIN_IDS
 # ──────────────────────────────────────────────
 #  CONVERSATION STATES
 # ──────────────────────────────────────────────
-# Admin: Add number
+# Admin: Add number (manual OTP)
 ADD_CAT, ADD_COUNTRY, ADD_NUM, ADD_PRICE, ADD_DESC, ADD_OTP_WAIT, ADD_2FA_WAIT = range(7)
 
 # User: Buy flow
 BUY_SERVICE, BUY_COUNTRY, BUY_QTY, BUY_CONFIRM = range(10, 14)
+
+# Admin: Bulk ZIP upload
+ZIP_FILE, ZIP_PLATFORM, ZIP_COUNTRY, ZIP_PRICE = range(20, 24)
 
 TOPUP_AMOUNTS = [50, 100, 200, 500, 1000]
 active_listeners: dict = {}
@@ -233,11 +234,10 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await show_main_menu(update.message, user, ctx)
 
 # ══════════════════════════════════════════════
-#  USER BUY FLOW – CONVERSATION
+#  USER BUY FLOW
 # ══════════════════════════════════════════════
 
 async def buy_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Step 1: Service choose karo (WhatsApp/Telegram etc)"""
     q = update.callback_query
     if q: await q.answer()
     if not await force_join_gate(update, ctx): return ConversationHandler.END
@@ -263,7 +263,6 @@ async def buy_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return BUY_SERVICE
 
 async def buy_service_chosen(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Step 2: Country choose karo"""
     q = update.callback_query; await q.answer()
     service = q.data.split(":", 1)[1]
     ctx.user_data["buy_service"] = service
@@ -287,7 +286,6 @@ async def buy_service_chosen(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return BUY_COUNTRY
 
 async def buy_country_chosen(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Step 3: Kitne numbers chahiye"""
     q = update.callback_query; await q.answer()
     country = q.data.split(":", 1)[1]
     ctx.user_data["buy_country"] = country
@@ -344,7 +342,6 @@ async def buy_country_chosen(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return BUY_QTY
 
 async def buy_qty_chosen(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Step 4: Confirm"""
     q = update.callback_query; await q.answer()
     qty     = int(q.data.split(":")[1])
     service = ctx.user_data["buy_service"]
@@ -373,7 +370,6 @@ async def buy_qty_chosen(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return BUY_CONFIRM
 
 async def buy_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Step 5: Purchase complete"""
     q = update.callback_query; await q.answer()
     user    = q.from_user
     service = ctx.user_data["buy_service"]
@@ -594,10 +590,13 @@ async def show_admin_panel(msg, ctx):
             InlineKeyboardButton("🗑 Number Hatao",      callback_data="admin:removenumber"),
         ],
         [
+            InlineKeyboardButton("📦 Bulk ZIP Upload",   callback_data="admin:zipupload"),
             InlineKeyboardButton("📋 Saare Orders",      callback_data="admin:orders"),
-            InlineKeyboardButton("💰 Pending Top-ups",   callback_data="admin:topuprequests"),
         ],
-        [InlineKeyboardButton("📁 Sessions List",        callback_data="admin:sessions")],
+        [
+            InlineKeyboardButton("💰 Pending Top-ups",   callback_data="admin:topuprequests"),
+            InlineKeyboardButton("📁 Sessions List",      callback_data="admin:sessions"),
+        ],
         [InlineKeyboardButton("🏠 Main Menu",            callback_data="menu:home")],
     ]
     await msg.edit_text(text, reply_markup=InlineKeyboardMarkup(btns), parse_mode="Markdown")
@@ -643,16 +642,23 @@ async def cb_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Back", callback_data="menu:admin")]]))
 
     elif action == "sessions":
-        files = list(SESSIONS_DIR.glob("*.session"))
+        files = []
+        for sf in SESSIONS_DIR.rglob("*.session"):
+            files.append(sf)
         text  = "📁 *Sessions:*\n\n"
         if not files: text += "Koi session nahi."
         else:
             for f in files:
-                row  = db_one("SELECT number,status,country FROM numbers WHERE session_file=?", (f.name,))
+                rel  = str(f.relative_to(SESSIONS_DIR))
+                row  = db_one("SELECT number,status,country FROM numbers WHERE session_file=?", (rel,))
                 info = f"`{row['number']}` ({row['country']}) – {row['status']}" if row else "unlinked"
-                text += f"• `{f.name}` → {info}\n"
+                text += f"• `{rel}` → {info}\n"
         await q.edit_message_text(text, parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Back", callback_data="menu:admin")]]))
+
+    elif action == "zipupload":
+        # ZIP upload conversation start – handled by zip_conv
+        pass
 
 async def cb_delete_number(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
@@ -666,6 +672,154 @@ async def cb_delete_number(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if p.exists(): p.unlink()
         await q.answer(f"✅ Number #{nid} delete ho gaya.", show_alert=True)
     await show_admin_panel(q.message, ctx)
+
+# ══════════════════════════════════════════════
+#  ADMIN: BULK ZIP UPLOAD FLOW
+# ══════════════════════════════════════════════
+
+async def admin_zip_upload_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    if not is_admin(q.from_user.id):
+        await q.answer("❌ Permission nahi.", show_alert=True)
+        return ConversationHandler.END
+
+    await q.message.reply_text(
+        "📦 *Bulk Session ZIP Upload*\n\n"
+        "ZIP file bhejein jisme `.session` files hoon 👇\n\n"
+        "_(JSON files bhi ho sakti hain, ignore kar dunga)_",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="admin:cancel_zip")]]),
+    )
+    return ZIP_FILE
+
+async def zip_file_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not update.message.document:
+        await update.message.reply_text("❌ ZIP file bhejein (.zip)"); return ZIP_FILE
+
+    doc = update.message.document
+    if not doc.file_name.endswith(".zip"):
+        await update.message.reply_text("❌ Sirf .zip file accept hogi."); return ZIP_FILE
+
+    await update.message.reply_text("⏳ File download ho rahi hai...")
+
+    file     = await doc.get_file()
+    zip_path = SESSIONS_DIR / f"temp_{doc.file_id}.zip"
+    await file.download_to_drive(str(zip_path))
+    ctx.user_data["zip_path"] = str(zip_path)
+
+    btns = [
+        [InlineKeyboardButton("📱 Telegram",  callback_data="zplat:Telegram")],
+        [InlineKeyboardButton("💬 WhatsApp",  callback_data="zplat:WhatsApp")],
+        [InlineKeyboardButton("📸 Instagram", callback_data="zplat:Instagram")],
+        [InlineKeyboardButton("📧 Gmail",     callback_data="zplat:Gmail")],
+        [InlineKeyboardButton("❌ Cancel",    callback_data="admin:cancel_zip")],
+    ]
+    await update.message.reply_text(
+        "✅ ZIP mil gaya!\n\n📱 *Yeh sessions kaunse platform ke hain?*",
+        reply_markup=InlineKeyboardMarkup(btns), parse_mode="Markdown"
+    )
+    return ZIP_PLATFORM
+
+async def zip_platform_chosen(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    ctx.user_data["zip_platform"] = q.data.split(":")[1]
+
+    await q.edit_message_text(
+        f"✅ Platform: *{ctx.user_data['zip_platform']}*\n\n"
+        f"🌍 *Country name type karein*\n_(e.g. Myanmar, India, USA)_:",
+        parse_mode="Markdown"
+    )
+    return ZIP_COUNTRY
+
+async def zip_country_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data["zip_country"] = update.message.text.strip()
+    await update.message.reply_text(
+        f"✅ Country: *{ctx.user_data['zip_country']}*\n\n"
+        f"💰 *Price per number dalein* (e.g. 99):",
+        parse_mode="Markdown"
+    )
+    return ZIP_PRICE
+
+async def zip_price_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    try:
+        price = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("❌ Sirf number dalein (e.g. 99):"); return ZIP_PRICE
+
+    ctx.user_data["zip_price"] = price
+    platform = ctx.user_data["zip_platform"]
+    country  = ctx.user_data["zip_country"]
+    zip_path = Path(ctx.user_data["zip_path"])
+
+    # Extract folder: sessions/Telegram/Myanmar/
+    extract_dir = SESSIONS_DIR / platform / country
+    extract_dir.mkdir(parents=True, exist_ok=True)
+
+    await update.message.reply_text("⏳ ZIP extract ho rahi hai...")
+
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            zf.extractall(str(extract_dir))
+        zip_path.unlink()
+    except Exception as e:
+        await update.message.reply_text(f"❌ ZIP extract error: `{e}`", parse_mode="Markdown")
+        return ConversationHandler.END
+
+    # Session files scan
+    session_files = list(extract_dir.glob("*.session"))
+    added = 0; skipped = 0
+
+    for sf in session_files:
+        phone        = sf.stem
+        session_rel  = f"{platform}/{country}/{sf.name}"
+        number       = phone if phone.startswith("+") else f"+{phone}"
+
+        existing = db_one("SELECT id FROM numbers WHERE session_file=? OR number=?", (session_rel, number))
+        if existing:
+            skipped += 1; continue
+
+        db_insert(
+            "INSERT OR IGNORE INTO numbers "
+            "(category,country,number,price,description,session_file,status) "
+            "VALUES (?,?,?,?,?,?,'available')",
+            (platform, country, number, price,
+             f"{platform} {country} Number", session_rel)
+        )
+        added += 1
+
+    await update.message.reply_text(
+        f"🎉 *ZIP Upload Complete!*\n\n"
+        f"📱 Platform: *{platform}*\n"
+        f"🌍 Country: *{country}*\n"
+        f"💰 Price: ₹{price} per number\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"✅ Added: *{added}* numbers\n"
+        f"⏭ Skipped (duplicate): *{skipped}*\n"
+        f"📁 Location: `sessions/{platform}/{country}/`",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📦 Aur ZIP Upload", callback_data="admin:zipupload")],
+            [InlineKeyboardButton("🔐 Admin Panel",    callback_data="menu:admin")],
+        ])
+    )
+    ctx.user_data.clear()
+    return ConversationHandler.END
+
+async def zip_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # Temp zip cleanup
+    zip_path = ctx.user_data.pop("zip_path", None)
+    if zip_path:
+        p = Path(zip_path)
+        if p.exists(): p.unlink()
+    ctx.user_data.clear()
+
+    markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Admin Panel", callback_data="menu:admin")]])
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.message.reply_text("❌ ZIP upload cancel ho gaya.", reply_markup=markup)
+    else:
+        await update.message.reply_text("❌ ZIP upload cancel ho gaya.", reply_markup=markup)
+    return ConversationHandler.END
 
 # ══════════════════════════════════════════════
 #  ADMIN: ADD NUMBER VIA OTP + 2FA FLOW
@@ -803,7 +957,6 @@ async def add_otp_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
 async def add_2fa_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """2FA password verify karo"""
     password = update.message.text.strip()
     client   = ctx.user_data.get("pyro_client")
 
@@ -834,7 +987,6 @@ async def add_2fa_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
 async def _save_number_session(update, ctx, client):
-    """Session save karo DB mein"""
     phone        = ctx.user_data["number"]
     safe_name    = ctx.user_data["safe_name"]
     session_file = f"{safe_name}.session"
@@ -954,14 +1106,14 @@ async def start_otp_listener(bot_app, number_id, buyer_id, number_str):
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Admin: Add number (OTP + 2FA support)
+    # Admin: Add number (OTP + 2FA)
     add_conv = ConversationHandler(
         entry_points=[
             CommandHandler("addnumber", admin_addnumber_cmd),
             CallbackQueryHandler(admin_addnumber_cmd, pattern="^admin:addnumber$"),
         ],
         states={
-            ADD_CAT:      [CallbackQueryHandler(add_cat,       pattern="^setcat:")],
+            ADD_CAT:      [CallbackQueryHandler(add_cat,         pattern="^setcat:")],
             ADD_COUNTRY:  [MessageHandler(filters.TEXT & ~filters.COMMAND, add_country)],
             ADD_NUM:      [MessageHandler(filters.TEXT & ~filters.COMMAND, add_num)],
             ADD_PRICE:    [MessageHandler(filters.TEXT & ~filters.COMMAND, add_price)],
@@ -974,7 +1126,26 @@ def main():
         per_message=False,
     )
 
-    # User: Buy number flow
+    # Admin: Bulk ZIP upload
+    zip_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(admin_zip_upload_start, pattern="^admin:zipupload$"),
+        ],
+        states={
+            ZIP_FILE:     [MessageHandler(filters.Document.ALL, zip_file_received)],
+            ZIP_PLATFORM: [CallbackQueryHandler(zip_platform_chosen, pattern="^zplat:")],
+            ZIP_COUNTRY:  [MessageHandler(filters.TEXT & ~filters.COMMAND, zip_country_received)],
+            ZIP_PRICE:    [MessageHandler(filters.TEXT & ~filters.COMMAND, zip_price_received)],
+        },
+        fallbacks=[
+            CommandHandler("cancel", zip_cancel),
+            CallbackQueryHandler(zip_cancel, pattern="^admin:cancel_zip$"),
+        ],
+        allow_reentry=True,
+        per_message=False,
+    )
+
+    # User: Buy number
     buy_conv = ConversationHandler(
         entry_points=[
             CallbackQueryHandler(buy_start, pattern="^menu:buynumber$"),
@@ -994,6 +1165,7 @@ def main():
     )
 
     app.add_handler(add_conv)
+    app.add_handler(zip_conv)
     app.add_handler(buy_conv)
 
     app.add_handler(CommandHandler("start",     cmd_start))
