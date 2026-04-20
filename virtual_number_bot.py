@@ -31,12 +31,14 @@ PAYMENT_INFO   = "UPI: solankiraghu7572-1@okhdfcbank"
 API_ID         = 39917988
 API_HASH       = "bd827dbeac6a55896ff11539bc80365b"
 
-FORCE_CHANNEL_USERNAME = "yourchannel"
-FORCE_CHANNEL_LINK     = "https://t.me/yourchannel"
-FORCE_CHANNEL_ID       = -1001234567890
+# Force Join – apne channel ka username (@ ke bina) ya ID
+FORCE_CHANNEL_USERNAME = "@datacheak"
+FORCE_CHANNEL_LINK     = "https://t.me/datacheak"
+FORCE_CHANNEL_ID       = -1003581162306
 
-SUPPORT_GROUP_LINK   = "https://t.me/yoursupportgroup"
-SUPPORT_CHANNEL_LINK = "https://t.me/yourchannel"
+# Support
+SUPPORT_GROUP_LINK   = "https://t.me/yughumai"
+SUPPORT_CHANNEL_LINK = "https://t.me/datacheak"
 
 SESSIONS_DIR = Path("sessions")
 SESSIONS_DIR.mkdir(exist_ok=True)
