@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Virtual Number Bot – Full UI + Force Join + Wallet + OTP + 2FA + Country Buy Flow
+Virtual Number Bot – Telethon + PTB + 2FA + Country Buy Flow
 """
 
 import asyncio
@@ -9,9 +9,8 @@ import re
 import sqlite3
 from pathlib import Path
 
-from pyrogram import Client
-from pyrogram.errors import SessionPasswordNeeded
-from pyrogram.handlers import MessageHandler as PyroMsgHandler
+from telethon import TelegramClient, events
+from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -19,22 +18,20 @@ from telegram.ext import (
     MessageHandler, ConversationHandler, filters, ContextTypes,
 )
 
-BOT_TOKEN      = "8374340113:AAElS1BoY4qIL7yt-Tcq_pbVRJc07gG1q6A"
-ADMIN_IDS      = [8263530800]
-PAYMENT_INFO   = "UPI: solankiraghu7572-1@okhdfcbank"
-API_ID         = 39917988
-API_HASH       = "bd827dbeac6a55896ff11539bc80365b"
+BOT_TOKEN    = "8374340113:AAElS1BoY4qIL7yt-Tcq_pbVRJc07gG1q6A"
+ADMIN_IDS    = [8263530800]
+PAYMENT_INFO = "UPI: solankiraghu7572-1@okhdfcbank"
+API_ID       = 39917988
+API_HASH     = "bd827dbeac6a55896ff11539bc80365b"
 
-FORCE_CHANNEL_USERNAME = "@datacheak"
-FORCE_CHANNEL_LINK     = "https://t.me/datacheak"
-FORCE_CHANNEL_ID       = -1003581162306
-
-SUPPORT_GROUP_LINK   = "https://t.me/yughumai"
+FORCE_CHANNEL_LINK = "https://t.me/datacheak"
+FORCE_CHANNEL_ID   = -1003581162306
+SUPPORT_GROUP_LINK = "https://t.me/yughumai"
 SUPPORT_CHANNEL_LINK = "https://t.me/datacheak"
 
 SESSIONS_DIR = Path("sessions")
 SESSIONS_DIR.mkdir(exist_ok=True)
-OTP_TIMEOUT  = 300
+OTP_TIMEOUT = 300
 
 # ── DATABASE ──
 def get_con():
@@ -46,39 +43,39 @@ def db_init():
     con = get_con()
     con.executescript("""
         CREATE TABLE IF NOT EXISTS users (
-            user_id   INTEGER PRIMARY KEY,
-            username  TEXT,
-            balance   INTEGER DEFAULT 0
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            balance INTEGER DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS numbers (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            category     TEXT,
-            country      TEXT DEFAULT 'India',
-            number       TEXT UNIQUE,
-            price        INTEGER,
-            description  TEXT,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            category TEXT,
+            country TEXT DEFAULT 'India',
+            number TEXT UNIQUE,
+            price INTEGER,
+            description TEXT,
             session_file TEXT,
-            status       TEXT DEFAULT 'available'
+            status TEXT DEFAULT 'available'
         );
         CREATE TABLE IF NOT EXISTS orders (
-            id        INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id   INTEGER,
-            username  TEXT,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            username TEXT,
             number_id INTEGER,
-            status    TEXT DEFAULT 'pending'
+            status TEXT DEFAULT 'pending'
         );
         CREATE TABLE IF NOT EXISTS topup_requests (
-            id        INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id   INTEGER,
-            username  TEXT,
-            amount    INTEGER,
-            status    TEXT DEFAULT 'pending'
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            username TEXT,
+            amount INTEGER,
+            status TEXT DEFAULT 'pending'
         );
     """)
     try:
         con.execute("ALTER TABLE numbers ADD COLUMN country TEXT DEFAULT 'India'")
         con.commit()
-    except Exception:
+    except:
         pass
     con.commit(); con.close()
 
@@ -135,7 +132,7 @@ async def force_join_gate(update, ctx):
             [InlineKeyboardButton("📢 Channel Join Karein", url=FORCE_CHANNEL_LINK)],
             [InlineKeyboardButton("✅ Maine Join Kar Liya", callback_data="check_join")],
         ])
-        text = "⚠️ *Bot Use Karne Ke Liye Channel Join Karein!*\n\n📢 Pehle channel join karein, phir bot use karein."
+        text = "⚠️ *Bot Use Karne Ke Liye Channel Join Karein!*\n\n📢 Pehle channel join karein."
         if update.callback_query:
             await update.callback_query.answer("Pehle channel join karein!", show_alert=True)
             await update.callback_query.message.reply_text(text, reply_markup=btn, parse_mode="Markdown")
@@ -147,11 +144,11 @@ async def force_join_gate(update, ctx):
 async def cb_check_join(update, ctx):
     q = update.callback_query
     if await check_joined(ctx.bot, q.from_user.id):
-        await q.answer("✅ Shukriya! Ab aap bot use kar sakte hain.", show_alert=True)
+        await q.answer("✅ Shukriya!", show_alert=True)
         await q.message.delete()
         await show_main_menu(q.message, q.from_user, ctx, edit=False)
     else:
-        await q.answer("❌ Aapne abhi join nahi kiya!", show_alert=True)
+        await q.answer("❌ Abhi join nahi kiya!", show_alert=True)
 
 # ── MAIN MENU ──
 async def show_main_menu(msg, user, ctx, edit=False):
@@ -206,7 +203,7 @@ async def buy_start(update, ctx):
 
     services = db_all("SELECT DISTINCT category FROM numbers WHERE status='available'")
     if not services:
-        text = "😔 *Abhi Koi Number Available Nahi Hai*\n\nBaad mein aayein."
+        text = "😔 *Abhi Koi Number Available Nahi Hai*"
         markup = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="menu:home")]])
         if q: await q.message.edit_text(text, reply_markup=markup, parse_mode="Markdown")
         else: await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
@@ -225,18 +222,16 @@ async def buy_service_chosen(update, ctx):
     service = q.data.split(":", 1)[1]
     ctx.user_data["buy_service"] = service
 
-    countries = db_all(
-        "SELECT DISTINCT country FROM numbers WHERE status='available' AND category=?", (service,)
-    )
+    countries = db_all("SELECT DISTINCT country FROM numbers WHERE status='available' AND category=?", (service,))
     if not countries:
-        await q.edit_message_text(f"❌ *{service}* ke liye koi number available nahi.",
+        await q.edit_message_text(f"❌ *{service}* ke liye koi number nahi.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Back", callback_data="menu:buynumber")]]))
         return ConversationHandler.END
 
     btns = [[InlineKeyboardButton(f"🌍 {c['country']}", callback_data=f"bcnt:{c['country']}")] for c in countries]
     btns.append([InlineKeyboardButton("◀️ Back", callback_data="menu:buynumber")])
     await q.edit_message_text(
-        f"✅ Service: *{service}*\n\n🌍 *Kaunsa Country chahiye?*\n\nSelect karein 👇",
+        f"✅ Service: *{service}*\n\n🌍 *Country choose karein:*",
         reply_markup=InlineKeyboardMarkup(btns), parse_mode="Markdown"
     )
     return BUY_COUNTRY
@@ -247,10 +242,7 @@ async def buy_country_chosen(update, ctx):
     ctx.user_data["buy_country"] = country
     service = ctx.user_data["buy_service"]
 
-    nums = db_all(
-        "SELECT * FROM numbers WHERE status='available' AND category=? AND country=?",
-        (service, country)
-    )
+    nums = db_all("SELECT * FROM numbers WHERE status='available' AND category=? AND country=?", (service, country))
     if not nums:
         await q.edit_message_text(f"❌ *{country}* mein *{service}* ke liye koi number nahi.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Back", callback_data="menu:buynumber")]]))
@@ -264,7 +256,7 @@ async def buy_country_chosen(update, ctx):
 
     if max_buy == 0:
         await q.edit_message_text(
-            f"❌ *Balance Kam Hai!*\n\n💰 Balance: ₹{bal}\n🏷 Price: ₹{price}\n\nPehle balance add karein 👇",
+            f"❌ *Balance Kam Hai!*\n\n💰 Balance: ₹{bal}\n🏷 Price: ₹{price}",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("➕ Balance Add Karo", callback_data="menu:addbalance")],
@@ -273,14 +265,10 @@ async def buy_country_chosen(update, ctx):
         )
         return ConversationHandler.END
 
-    btns = [[InlineKeyboardButton(
-        f"{i} Number{'s' if i > 1 else ''} – ₹{i * price}",
-        callback_data=f"bqty:{i}"
-    )] for i in range(1, max_buy + 1)]
+    btns = [[InlineKeyboardButton(f"{i} Number{'s' if i>1 else ''} – ₹{i*price}", callback_data=f"bqty:{i}")] for i in range(1, max_buy+1)]
     btns.append([InlineKeyboardButton("◀️ Back", callback_data="menu:buynumber")])
-
     await q.edit_message_text(
-        f"✅ Service: *{service}* | Country: *{country}*\n"
+        f"✅ *{service}* | 🌍 *{country}*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"💰 Price: ₹{price} per number\n"
         f"📦 Available: {available}\n"
@@ -309,8 +297,7 @@ async def buy_qty_chosen(update, ctx):
         f"🔢 Quantity: *{qty}*\n"
         f"💰 Total: ₹{price} × {qty} = *₹{total}*\n"
         f"💳 Balance baad mein: ₹{bal - total}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"Confirm karein? 👇",
+        f"━━━━━━━━━━━━━━━━━━━━",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton(f"✅ Confirm – ₹{total} Pay", callback_data="bconfirm:yes")],
@@ -330,16 +317,13 @@ async def buy_confirm(update, ctx):
     bal = get_balance(user.id)
 
     if bal < total:
-        await q.edit_message_text("❌ *Balance Kam Ho Gaya!*\n\nPehle balance add karein.", parse_mode="Markdown",
+        await q.edit_message_text("❌ *Balance Kam Ho Gaya!*", parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ Balance Add Karo", callback_data="menu:addbalance")]]))
         return ConversationHandler.END
 
-    nums = db_all(
-        "SELECT * FROM numbers WHERE status='available' AND category=? AND country=? LIMIT ?",
-        (service, country, qty)
-    )
+    nums = db_all("SELECT * FROM numbers WHERE status='available' AND category=? AND country=? LIMIT ?", (service, country, qty))
     if len(nums) < qty:
-        await q.edit_message_text(f"❌ Sirf *{len(nums)}* number available hai.\n\nDobara try karein.", parse_mode="Markdown",
+        await q.edit_message_text(f"❌ Sirf *{len(nums)}* number available.", parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="menu:home")]]))
         return ConversationHandler.END
 
@@ -354,16 +338,13 @@ async def buy_confirm(update, ctx):
     new_bal = get_balance(user.id)
     text = (
         f"🎉 *Purchase Successful!*\n\n"
-        f"📱 Service: *{service}*\n"
-        f"🌍 Country: *{country}*\n"
-        f"💰 Paid: ₹{total}\n"
-        f"💳 Remaining: ₹{new_bal}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📞 *Aapke Numbers:*\n"
+        f"📱 *{service}* | 🌍 *{country}*\n"
+        f"💰 Paid: ₹{total} | Remaining: ₹{new_bal}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n📞 *Aapke Numbers:*\n"
     )
     for i, n in enumerate(bought, 1):
         text += f"{i}. `{n['number']}`\n"
-    text += "\n⏳ OTP listener start ho gaya! Message aane pe turant notify karunga 🚀"
+    text += "\n⏳ OTP listener start ho gaya! 🚀"
 
     await q.edit_message_text(text, parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
@@ -376,7 +357,7 @@ async def buy_confirm(update, ctx):
         try:
             await ctx.bot.send_message(aid,
                 f"🛒 *Naya Purchase!*\n👤 @{user.username or user.first_name} | `{user.id}`\n"
-                f"📱 {service} | 🌍 {country} | {qty} numbers | ₹{total}", parse_mode="Markdown")
+                f"📱 {service} | 🌍 {country} | {qty}x | ₹{total}", parse_mode="Markdown")
         except: pass
 
     for n in bought:
@@ -402,17 +383,15 @@ async def cb_menu(update, ctx):
 
     if action == "buynumber":
         await buy_start(update, ctx)
-
     elif action == "balance":
         bal = get_balance(user.id)
         await q.message.edit_text(
-            f"💰 *Aapka Balance*\n\nAvailable: *₹{bal}*\n\nBalance add karne ke liye niche button dabayein. 👇",
+            f"💰 *Aapka Balance*\n\nAvailable: *₹{bal}*",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("➕ Balance Add Karo", callback_data="menu:addbalance")],
                 [InlineKeyboardButton("🏠 Main Menu", callback_data="menu:home")],
             ]), parse_mode="Markdown"
         )
-
     elif action == "addbalance":
         btns = []; row = []
         for amt in TOPUP_AMOUNTS:
@@ -420,16 +399,15 @@ async def cb_menu(update, ctx):
             if len(row) == 3: btns.append(row); row = []
         if row: btns.append(row)
         btns.append([InlineKeyboardButton("🏠 Main Menu", callback_data="menu:home")])
-        await q.message.edit_text("💳 *Balance Add Karein*\n\nKitna balance chahiye?",
+        await q.message.edit_text("💳 *Balance Add Karein*\n\nKitna chahiye?",
                                   reply_markup=InlineKeyboardMarkup(btns), parse_mode="Markdown")
-
     elif action == "myorders":
         rows = db_all(
             "SELECT o.*,n.number,n.price,n.category,n.country FROM orders o JOIN numbers n ON o.number_id=n.id WHERE o.user_id=?",
             (user.id,)
         )
         if not rows:
-            text = "📭 *Aapka Koi Order Nahi Hai*\n\nNumbers khareedne ke liye 'Number Kharido' dabayein."
+            text = "📭 *Koi Order Nahi Hai*"
         else:
             emo = {"pending": "⏳", "confirmed": "✅", "cancelled": "❌"}
             text = "📦 *Aapke Orders:*\n\n"
@@ -438,10 +416,8 @@ async def cb_menu(update, ctx):
         await q.message.edit_text(text,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="menu:home")]]),
             parse_mode="Markdown")
-
     elif action == "home":
         await show_main_menu(q.message, user, ctx, edit=True)
-
     elif action == "admin":
         if not is_admin(user.id):
             await q.answer("❌ Permission nahi.", show_alert=True); return
@@ -455,14 +431,7 @@ async def cb_topup_amount(update, ctx):
     rid = db_insert("INSERT INTO topup_requests (user_id,username,amount,status) VALUES (?,?,?,'pending')",
                     (user.id, user.username or user.first_name, amount))
     await q.edit_message_text(
-        f"💳 *Balance Recharge – ₹{amount}*\n\n"
-        f"Niche details pe payment karein:\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"{PAYMENT_INFO}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📌 Amount: *₹{amount}*\n"
-        f"🆔 Request ID: `{rid}`\n\n"
-        f"📸 Screenshot bhejo, admin confirm karega! ✅",
+        f"💳 *Balance Recharge – ₹{amount}*\n\n{PAYMENT_INFO}\n\n📌 Amount: *₹{amount}*\n🆔 ID: `{rid}`\n\n📸 Screenshot bhejo!",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("💬 Support", url=SUPPORT_GROUP_LINK)],
@@ -472,8 +441,8 @@ async def cb_topup_amount(update, ctx):
     for aid in ADMIN_IDS:
         try:
             await ctx.bot.send_message(aid,
-                f"🔔 *Naya Top-up!*\n👤 @{user.username or user.first_name} | `{user.id}`\n"
-                f"💰 ₹{amount} | `#{rid}`\n\nConfirm: `/topup {user.id} {amount}`", parse_mode="Markdown")
+                f"🔔 *Top-up Request!*\n👤 @{user.username or user.first_name} | `{user.id}`\n"
+                f"💰 ₹{amount} | `#{rid}`\nConfirm: `/topup {user.id} {amount}`", parse_mode="Markdown")
         except: pass
 
 async def handle_screenshot(update, ctx):
@@ -483,14 +452,11 @@ async def handle_screenshot(update, ctx):
         try:
             await ctx.bot.forward_message(aid, update.effective_chat.id, update.message.message_id)
             await ctx.bot.send_message(aid,
-                f"📸 *Screenshot*\n👤 @{user.username or user.first_name} | `{user.id}`\n"
-                f"Balance add: `/topup {user.id} <amount>`", parse_mode="Markdown")
+                f"📸 @{user.username or user.first_name} | `{user.id}`\n`/topup {user.id} <amount>`",
+                parse_mode="Markdown")
         except: pass
-    await update.message.reply_text("✅ *Screenshot Bhej Diya!*\n\n⏳ Admin confirm karega.",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("💬 Support", url=SUPPORT_GROUP_LINK)],
-            [InlineKeyboardButton("🏠 Main Menu", callback_data="menu:home")],
-        ]))
+    await update.message.reply_text("✅ *Screenshot Bhej Diya!* Admin confirm karega.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="menu:home")]]))
 
 # ── ADMIN PANEL ──
 async def show_admin_panel(msg, ctx):
@@ -499,23 +465,21 @@ async def show_admin_panel(msg, ctx):
     pending = db_all("SELECT * FROM topup_requests WHERE status='pending'")
     avail = len([n for n in nums if n["status"] == "available"])
     text = (
-        f"🔐 *Admin Panel*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔐 *Admin Panel*\n━━━━━━━━━━━━━━━━━━━━\n"
         f"📱 Numbers: {len(nums)} | Available: {avail}\n"
         f"📦 Orders: {len(orders)}\n"
-        f"💰 Pending Top-ups: {len(pending)}\n"
-        f"━━━━━━━━━━━━━━━━━━━━"
+        f"💰 Pending Top-ups: {len(pending)}\n━━━━━━━━━━━━━━━━━━━━"
     )
     btns = [
         [
-            InlineKeyboardButton("➕ Number Add (OTP)", callback_data="admin:addnumber"),
+            InlineKeyboardButton("➕ Number Add", callback_data="admin:addnumber"),
             InlineKeyboardButton("🗑 Number Hatao", callback_data="admin:removenumber"),
         ],
         [
-            InlineKeyboardButton("📋 Saare Orders", callback_data="admin:orders"),
-            InlineKeyboardButton("💰 Pending Top-ups", callback_data="admin:topuprequests"),
+            InlineKeyboardButton("📋 Orders", callback_data="admin:orders"),
+            InlineKeyboardButton("💰 Top-ups", callback_data="admin:topuprequests"),
         ],
-        [InlineKeyboardButton("📁 Sessions List", callback_data="admin:sessions")],
+        [InlineKeyboardButton("📁 Sessions", callback_data="admin:sessions")],
         [InlineKeyboardButton("🏠 Main Menu", callback_data="menu:home")],
     ]
     await msg.edit_text(text, reply_markup=InlineKeyboardMarkup(btns), parse_mode="Markdown")
@@ -531,30 +495,22 @@ async def cb_admin(update, ctx):
         if not nums:
             await q.edit_message_text("📭 Koi number nahi.",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Back", callback_data="menu:admin")]])); return
-        btns = [[InlineKeyboardButton(
-            f"🗑 #{n['id']} {n['category']} {n['country']} {n['number']} ₹{n['price']}",
+        btns = [[InlineKeyboardButton(f"🗑 #{n['id']} {n['category']} {n['country']} {n['number']} ₹{n['price']}",
             callback_data=f"del:{n['id']}")] for n in nums]
         btns.append([InlineKeyboardButton("◀️ Back", callback_data="menu:admin")])
-        await q.edit_message_text("🗑 *Kaun sa number hatana hai?*",
-                                  reply_markup=InlineKeyboardMarkup(btns), parse_mode="Markdown")
+        await q.edit_message_text("🗑 *Kaun sa hatana hai?*", reply_markup=InlineKeyboardMarkup(btns), parse_mode="Markdown")
 
     elif action == "orders":
         rows = db_all("SELECT o.*,n.number,n.price,n.country FROM orders o JOIN numbers n ON o.number_id=n.id")
-        text = "📋 *Saare Orders:*\n\n"
-        if not rows: text += "Koi order nahi."
-        else:
-            for o in rows:
-                text += f"`#{o['id']}` @{o['username']} | `{o['number']}` | {o['country']} | ₹{o['price']} | *{o['status']}*\n"
+        text = "📋 *Orders:*\n\n" + ("Koi nahi." if not rows else
+               "".join(f"`#{o['id']}` @{o['username']} | `{o['number']}` | {o['country']} | ₹{o['price']} | *{o['status']}*\n" for o in rows))
         await q.edit_message_text(text, parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Back", callback_data="menu:admin")]]))
 
     elif action == "topuprequests":
         rows = db_all("SELECT * FROM topup_requests WHERE status='pending'")
-        text = "💰 *Pending Top-up Requests:*\n\n"
-        if not rows: text += "Koi pending nahi."
-        else:
-            for r in rows:
-                text += f"`#{r['id']}` @{r['username']} | `{r['user_id']}` | ₹{r['amount']}\nConfirm: `/topup {r['user_id']} {r['amount']}`\n\n"
+        text = "💰 *Pending Top-ups:*\n\n" + ("Koi nahi." if not rows else
+               "".join(f"`#{r['id']}` @{r['username']} | `{r['user_id']}` | ₹{r['amount']}\n`/topup {r['user_id']} {r['amount']}`\n\n" for r in rows))
         await q.edit_message_text(text, parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Back", callback_data="menu:admin")]]))
 
@@ -580,10 +536,10 @@ async def cb_delete_number(update, ctx):
         if row["session_file"]:
             p = SESSIONS_DIR / row["session_file"]
             if p.exists(): p.unlink()
-        await q.answer(f"✅ Number #{nid} delete ho gaya.", show_alert=True)
+        await q.answer(f"✅ #{nid} delete ho gaya.", show_alert=True)
     await show_admin_panel(q.message, ctx)
 
-# ── ADMIN ADD NUMBER (OTP + 2FA + COUNTRY) ──
+# ── ADMIN ADD NUMBER (TELETHON + 2FA + COUNTRY) ──
 async def admin_addnumber_cmd(update, ctx):
     if not is_admin(update.effective_user.id):
         if update.message: await update.message.reply_text("❌ Permission nahi.")
@@ -607,17 +563,14 @@ async def add_cat(update, ctx):
     q = update.callback_query; await q.answer()
     ctx.user_data["cat"] = q.data.split(":")[1]
     await q.edit_message_text(
-        f"✅ Category: *{ctx.user_data['cat']}*\n\n🌍 Country name dalein (e.g. India, USA, UK):",
+        f"✅ Category: *{ctx.user_data['cat']}*\n\n🌍 Country dalein (e.g. India, USA):",
         parse_mode="Markdown"
     )
     return ADD_COUNTRY
 
 async def add_country(update, ctx):
     ctx.user_data["country"] = update.message.text.strip()
-    await update.message.reply_text(
-        f"✅ Country: *{ctx.user_data['country']}*\n\n📞 Phone number dalein (+91XXXXXXXXXX):",
-        parse_mode="Markdown"
-    )
+    await update.message.reply_text(f"✅ Country: *{ctx.user_data['country']}*\n\n📞 Phone number dalein (+91...):", parse_mode="Markdown")
     return ADD_NUM
 
 async def add_num(update, ctx):
@@ -635,24 +588,35 @@ async def add_price(update, ctx):
 async def add_desc(update, ctx):
     ctx.user_data["desc"] = update.message.text.strip()
     phone = ctx.user_data["number"]
+    safe_name = phone.replace("+", "").replace(" ", "")
+    session_path = str(SESSIONS_DIR / safe_name)
+
     await update.message.reply_text(
         f"📲 *OTP Bheja Ja Raha Hai...*\n\n📞 `{phone}`\n\n⏳ Please wait...",
         parse_mode="Markdown"
     )
-    safe_name = phone.replace("+", "").replace(" ", "")
-    session_path = str(SESSIONS_DIR / safe_name)
+
     try:
-        client = Client(session_path, api_id=API_ID, api_hash=API_HASH)
+        # Telethon client - alag loop mein run hoga, freeze nahi hoga!
+        client = TelegramClient(session_path, API_ID, API_HASH)
         await client.connect()
-        sent = await client.send_code(phone)
-        ctx.user_data["phone_code_hash"] = sent.phone_code_hash
-        ctx.user_data["safe_name"] = safe_name
-        ctx.user_data["pyro_client"] = client
-        await update.message.reply_text(
-            f"✅ *OTP Bhej Diya!*\n\n📞 `{phone}` pe OTP aaya hoga.\n\n🔢 OTP type karein:",
-            parse_mode="Markdown"
-        )
-        return ADD_OTP_WAIT
+
+        if not await client.is_user_authorized():
+            sent = await client.send_code_request(phone)
+            ctx.user_data["phone_code_hash"] = sent.phone_code_hash
+            ctx.user_data["safe_name"] = safe_name
+            ctx.user_data["tele_client"] = client
+
+            await update.message.reply_text(
+                f"✅ *OTP Bhej Diya!*\n\n📞 `{phone}` pe OTP aaya hoga.\n\n🔢 OTP type karein:",
+                parse_mode="Markdown"
+            )
+            return ADD_OTP_WAIT
+        else:
+            # Already authorized
+            await _save_session_telethon(update, ctx, client, safe_name)
+            return ConversationHandler.END
+
     except Exception as e:
         log.error(f"OTP send error: {e}")
         await update.message.reply_text(f"❌ *Error:* `{e}`", parse_mode="Markdown",
@@ -662,66 +626,77 @@ async def add_desc(update, ctx):
 async def add_otp_received(update, ctx):
     otp = update.message.text.strip().replace(" ", "")
     phone = ctx.user_data.get("number")
-    client = ctx.user_data.get("pyro_client")
+    client = ctx.user_data.get("tele_client")
+
     if not client:
         await update.message.reply_text("❌ Session expire. Dobara /addnumber try karein.")
         return ConversationHandler.END
+
     await update.message.reply_text("⏳ Verify ho raha hai...")
+
     try:
-        await client.sign_in(phone_number=phone,
-                             phone_code_hash=ctx.user_data["phone_code_hash"],
-                             phone_code=otp)
-        await _save_session(update, ctx, client)
+        await client.sign_in(phone, otp, phone_code_hash=ctx.user_data["phone_code_hash"])
+        await _save_session_telethon(update, ctx, client, ctx.user_data["safe_name"])
         return ConversationHandler.END
-    except SessionPasswordNeeded:
+
+    except SessionPasswordNeededError:
         await update.message.reply_text(
-            "🔐 *2FA On Hai!*\n\nIs number ka 2FA password dalein 👇",
+            "🔐 *2FA On Hai!*\n\n2FA password dalein 👇",
             parse_mode="Markdown"
         )
         return ADD_2FA_WAIT
-    except Exception as e:
-        err = str(e)
-        if "PHONE_CODE_INVALID" in err:
-            await update.message.reply_text("❌ *OTP Galat!* Dobara dalein:", parse_mode="Markdown")
-            return ADD_OTP_WAIT
-        elif "PHONE_CODE_EXPIRED" in err:
-            msg = "⏰ *OTP Expire!* /addnumber se dobara try karein."
-        else:
-            msg = f"❌ *Error:* `{err}`"
+
+    except PhoneCodeInvalidError:
+        await update.message.reply_text("❌ *OTP Galat!* Dobara dalein:", parse_mode="Markdown")
+        return ADD_OTP_WAIT
+
+    except PhoneCodeExpiredError:
         try: await client.disconnect()
         except: pass
-        ctx.user_data.pop("pyro_client", None)
-        await update.message.reply_text(msg, parse_mode="Markdown",
+        ctx.user_data.pop("tele_client", None)
+        await update.message.reply_text("⏰ *OTP Expire!* /addnumber se dobara try karein.", parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Admin Panel", callback_data="menu:admin")]]))
+        return ConversationHandler.END
+
+    except Exception as e:
+        try: await client.disconnect()
+        except: pass
+        ctx.user_data.pop("tele_client", None)
+        await update.message.reply_text(f"❌ *Error:* `{e}`", parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Admin Panel", callback_data="menu:admin")]]))
         return ConversationHandler.END
 
 async def add_2fa_received(update, ctx):
     password = update.message.text.strip()
-    client = ctx.user_data.get("pyro_client")
+    client = ctx.user_data.get("tele_client")
+
     if not client:
         await update.message.reply_text("❌ Session expire. Dobara /addnumber try karein.")
         return ConversationHandler.END
+
     await update.message.reply_text("⏳ 2FA verify ho raha hai...")
+
     try:
-        await client.check_password(password)
-        await _save_session(update, ctx, client)
+        await client.sign_in(password=password)
+        await _save_session_telethon(update, ctx, client, ctx.user_data["safe_name"])
         return ConversationHandler.END
+
     except Exception as e:
-        if "PASSWORD_HASH_INVALID" in str(e):
+        if "PASSWORD" in str(e).upper() or "Invalid" in str(e):
             await update.message.reply_text("❌ *2FA Password Galat!* Dobara dalein:", parse_mode="Markdown")
             return ADD_2FA_WAIT
         try: await client.disconnect()
         except: pass
-        ctx.user_data.pop("pyro_client", None)
+        ctx.user_data.pop("tele_client", None)
         await update.message.reply_text(f"❌ *2FA Error:* `{e}`", parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Admin Panel", callback_data="menu:admin")]]))
         return ConversationHandler.END
 
-async def _save_session(update, ctx, client):
+async def _save_session_telethon(update, ctx, client, safe_name):
     phone = ctx.user_data["number"]
-    safe_name = ctx.user_data["safe_name"]
     session_file = f"{safe_name}.session"
     await client.disconnect()
+
     nid = db_insert(
         "INSERT INTO numbers (category,country,number,price,description,session_file,status) VALUES (?,?,?,?,?,?,'available')",
         (ctx.user_data["cat"], ctx.user_data["country"], phone,
@@ -729,23 +704,20 @@ async def _save_session(update, ctx, client):
     )
     await update.message.reply_text(
         f"🎉 *Number Add Ho Gaya!*\n\n"
-        f"🆔 ID: `{nid}`\n"
-        f"📞 Number: `{phone}`\n"
-        f"📂 Category: {ctx.user_data['cat']}\n"
-        f"🌍 Country: {ctx.user_data['country']}\n"
-        f"💰 Price: ₹{ctx.user_data['price']}\n"
-        f"✅ Session save ho gaya!",
+        f"🆔 ID: `{nid}`\n📞 `{phone}`\n"
+        f"📂 {ctx.user_data['cat']} | 🌍 {ctx.user_data['country']}\n"
+        f"💰 ₹{ctx.user_data['price']}\n✅ Session save ho gaya!",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Aur Number Add", callback_data="admin:addnumber")],
             [InlineKeyboardButton("🔐 Admin Panel", callback_data="menu:admin")],
         ])
     )
-    ctx.user_data.pop("pyro_client", None)
+    ctx.user_data.pop("tele_client", None)
     ctx.user_data.pop("phone_code_hash", None)
 
 async def cancel_conv(update, ctx):
-    client = ctx.user_data.pop("pyro_client", None)
+    client = ctx.user_data.pop("tele_client", None)
     if client:
         try: await client.disconnect()
         except: pass
@@ -771,13 +743,13 @@ async def admin_topup(update, ctx):
     new_bal = get_balance(uid)
     try:
         await ctx.bot.send_message(uid,
-            f"✅ *Balance Add Ho Gaya!*\n\n💰 Added: *₹{amount}*\n💳 New Balance: *₹{new_bal}*\n\nAb /start se number khareedein! 🛒",
+            f"✅ *Balance Add Ho Gaya!*\n\n💰 Added: *₹{amount}*\n💳 New Balance: *₹{new_bal}*",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛒 Number Kharido", callback_data="menu:buynumber")]]))
     except: pass
-    await update.message.reply_text(f"✅ User `{uid}` ko ₹{amount} add. Balance: ₹{new_bal}", parse_mode="Markdown")
+    await update.message.reply_text(f"✅ `{uid}` ko ₹{amount} add. Balance: ₹{new_bal}", parse_mode="Markdown")
 
-# ── OTP LISTENER ──
+# ── OTP LISTENER (Telethon) ──
 async def start_otp_listener(bot_app, number_id, buyer_id, number_str):
     row = db_one("SELECT session_file FROM numbers WHERE id=?", (number_id,))
     if not row or not row["session_file"]:
@@ -786,24 +758,28 @@ async def start_otp_listener(bot_app, number_id, buyer_id, number_str):
     if not session_path.exists():
         await bot_app.bot.send_message(buyer_id, "❌ Session file nahi hai."); return
 
-    client = Client(str(session_path.with_suffix("")), api_id=API_ID, api_hash=API_HASH)
+    # Session file naam se extension hata do (Telethon khud .session lagata hai)
+    session_name = str(session_path.with_suffix(""))
+
+    client = TelegramClient(session_name, API_ID, API_HASH)
     active_listeners[number_id] = client
     received = asyncio.Event()
 
-    async def on_message(c, message):
-        text = message.text or message.caption or ""
+    @client.on(events.NewMessage)
+    async def on_message(event):
+        text = event.message.text or ""
         otp = extract_otp(text)
         reply = f"📨 *Naya Message!*\n\n📞 `{number_str}`\n💬 `{text}`"
         if otp: reply += f"\n\n🔐 *OTP: `{otp}`*"
         try:
             await bot_app.bot.send_message(buyer_id, reply, parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="menu:home")]]))
-        except Exception as e: log.error(e)
+        except Exception as e:
+            log.error(e)
         received.set()
 
-    client.add_handler(PyroMsgHandler(on_message))
     try:
-        await client.start()
+        await client.connect()
         try: await asyncio.wait_for(received.wait(), timeout=OTP_TIMEOUT)
         except asyncio.TimeoutError:
             await bot_app.bot.send_message(buyer_id,
@@ -811,7 +787,7 @@ async def start_otp_listener(bot_app, number_id, buyer_id, number_str):
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💬 Support", url=SUPPORT_GROUP_LINK)]]))
     finally:
-        try: await client.stop()
+        try: await client.disconnect()
         except: pass
         active_listeners.pop(number_id, None)
 
@@ -856,17 +832,14 @@ def main():
 
     app.add_handler(add_conv)
     app.add_handler(buy_conv)
-
     app.add_handler(CommandHandler("start",     cmd_start))
     app.add_handler(CommandHandler("topup",     admin_topup))
     app.add_handler(CommandHandler("addnumber", admin_addnumber_cmd))
-
     app.add_handler(CallbackQueryHandler(cb_check_join,    pattern="^check_join$"))
     app.add_handler(CallbackQueryHandler(cb_menu,          pattern="^menu:"))
     app.add_handler(CallbackQueryHandler(cb_topup_amount,  pattern="^topup:"))
     app.add_handler(CallbackQueryHandler(cb_admin,         pattern="^admin:"))
     app.add_handler(CallbackQueryHandler(cb_delete_number, pattern="^del:"))
-
     app.add_handler(MessageHandler(filters.PHOTO, handle_screenshot))
 
     print("🤖 Bot chal raha hai...")
